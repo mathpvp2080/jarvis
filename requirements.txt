@@ -1,0 +1,35 @@
+# Jarvis - dependências
+# Instalar com:  pip install -r requirements.txt
+# Requer Python 3.11 ou 3.12 (mediapipe ainda não suporta bem 3.13)
+
+# --- Interface gráfica (jarvis_tela.py) ---
+PySide6>=6.6
+# PySide6 já inclui QtWebEngine na instalação padrão.
+# Se der ImportError em QtWebEngineWidgets, instale também:
+# PySide6-Addons
+
+# --- Visão computacional ---
+mediapipe>=0.10.14
+opencv-python>=4.9
+
+# --- Captura de tela e OCR ---
+mss>=9.0
+pytesseract>=0.3.10
+Pillow>=10.0
+# ATENÇÃO: pytesseract é só um wrapper.
+# É preciso instalar o Tesseract-OCR separado (com o pacote de idioma português):
+# https://github.com/UB-Mannheim/tesseract/wiki
+
+# --- Áudio / voz ---
+sounddevice>=0.4.6
+SpeechRecognition>=3.10
+pyttsx3>=2.90          # usado só em teste_voz.py
+
+# --- Automação ---
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+selenium>=4.18
+
+# --- Utilidades ---
+numpy>=1.26,<2.1
+psutil>=5.9
