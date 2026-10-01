@@ -1,0 +1,12 @@
+{
+  "visualizacao_de_tela_ativada": true,
+  "filtro_palavroes_ativado": true,
+  "camera_ativada": true,
+  "bloquear_ao_sair": true,
+  "detectar_emocoes": true,
+  "exoesqueleto_facial": true,
+  "holograma_ativado": true,
+  "reagir_a_gestos": true,
+  "bloquear_com_punho": true,
+  "visao_ativada": true
+}
