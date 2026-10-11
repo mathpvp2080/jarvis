@@ -1,8 +1,10 @@
+import ctypes
 import html
 import math
 import os
 import sys
 import subprocess
+import time
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -47,13 +49,15 @@ from jarvis_comum import (
     consumir_eventos,
     escrever_json_atomico,
     ler_json,
+    ler_jsonl,
     publicar_comando,
     registrar_excecoes_nao_tratadas,
 )
 from jarvis_voz import GerenciadorDeVoz
 
 PASTA = Path(__file__).resolve().parent
-ARQUIVO_MEMORIA = PASTA / "memoria_jarvis.json"
+ARQUIVO_MEMORIA = PASTA / "memoria_jarvis.jsonl"
+ARQUIVO_MEMORIA_LEGADO = PASTA / "memoria_jarvis.json"
 ARQUIVO_CONFIG = PASTA / "config_jarvis.json"
 
 log = configurar_log("jarvis.tela")
@@ -68,6 +72,19 @@ def registrar_aviso(mensagem: str) -> None:
 
 
 registrar_excecoes_nao_tratadas(log, ao_avisar=registrar_aviso)
+
+
+# Teclas usadas pelos gestos (códigos virtuais do Windows).
+CODIGOS_DE_TECLA = {
+    "PGUP": 0x21,
+    "PGDN": 0x22,
+    "SPACE": 0x20,
+    "LEFT": 0x25,
+    "RIGHT": 0x27,
+    "ALT": 0x12,
+}
+
+_CONFIG_EM_CACHE = {"assinatura": None, "dados": None}
 
 
 def carregar_config():
@@ -95,11 +112,25 @@ def carregar_config():
         "silencio_para_encerrar": 1.0,
     }
 
+    try:
+        estado = ARQUIVO_CONFIG.stat()
+        assinatura = (estado.st_mtime_ns, estado.st_size)
+    except OSError:
+        assinatura = None
+
+    # O timer da câmera chama isto várias vezes por segundo; sem cache, o
+    # arquivo era lido e reprocessado a cada 220 ms.
+    if _CONFIG_EM_CACHE["assinatura"] == assinatura and _CONFIG_EM_CACHE["dados"] is not None:
+        return dict(_CONFIG_EM_CACHE["dados"])
+
     dados = ler_json(ARQUIVO_CONFIG, {})
     if isinstance(dados, dict):
         padrao.update(dados)
 
-    return padrao
+    _CONFIG_EM_CACHE["assinatura"] = assinatura
+    _CONFIG_EM_CACHE["dados"] = padrao
+
+    return dict(padrao)
 
 
 def salvar_config(config):
@@ -206,7 +237,6 @@ class JanelaJarvis(QMainWindow):
         self.inicio = datetime.now()
         self.ultimo_html_chat = ""
         self.camera = None
-        self.frame_anterior = None
 
         # Modelos da câmera: garantidos aqui, com aviso claro se faltarem.
         self.modelos_faltando = preparar_modelos_da_camera()
@@ -692,7 +722,6 @@ class JanelaJarvis(QMainWindow):
         self.abas_navegador.tabCloseRequested.connect(self.fechar_aba_navegador)
         self.abas_navegador.currentChanged.connect(self.trocar_aba_navegador)
         self.abas_navegador.addTab(self.navegador, "YouTube Music")
-        self.layout_navegador = layout_navegador
         layout_navegador.addLayout(barra_navegador)
         layout_navegador.addWidget(self.abas_navegador)
         layout_navegador.addLayout(botoes_navegador)
@@ -916,9 +945,6 @@ class JanelaJarvis(QMainWindow):
         self.layout_conversa.insertWidget(0, self.historico)
         self.atualizar_historico()
 
-    def processar_pagina_navegador(self, carregou):
-        self.processar_pagina_aba(self.navegador, carregou)
-
     def abrir_primeiro_resultado_musica(self, view=None):
         view = view or self.navegador
         if "music.youtube.com/search" not in view.url().toString():
@@ -1093,7 +1119,6 @@ class JanelaJarvis(QMainWindow):
 
         self.ultimo_frame_ok = datetime.now().timestamp()
         frame = cv2.flip(frame, 1)
-        self.detectar_movimento(frame)
         imagem_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resultado_rosto = self.detector_rosto.detect(
             MpImage(
@@ -1306,6 +1331,20 @@ class JanelaJarvis(QMainWindow):
                 )
                 log.info("Holograma %s", "ligado" if self.holograma_visivel else "desligado")
 
+            elif tipo == "esconder_painel":
+                log.info("Pedido de voz: esconder o painel")
+                self.esconder_painel()
+
+            elif tipo == "definir_camera":
+                ativada = bool(dados.get("ativada", True))
+                config = carregar_config()
+                config["camera_ativada"] = ativada
+                salvar_config(config)
+                log.info("Câmera %s por pedido de voz", "ligada" if ativada else "desligada")
+                self.camera_status.setText(
+                    "● Câmera " + ("ligada" if ativada else "desligada")
+                )
+
             elif tipo == "navegar_navegador":
                 url = dados.get("url", "")
                 if url:
@@ -1449,48 +1488,6 @@ class JanelaJarvis(QMainWindow):
         if self.janela_camera_cheia is not None:
             self.janela_camera_cheia.close()
 
-    def palma_virada_para_cima(self, mao):
-        dedos_estendidos = sum(
-            mao[ponta].y < mao[articulacao].y
-            for ponta, articulacao in [(8, 6), (12, 10), (16, 14), (20, 18)]
-        )
-        palma_aberta = dedos_estendidos >= 3
-        palma_inclinada = mao[12].y < mao[0].y + 0.12
-        return palma_aberta and palma_inclinada
-
-    def atualizar_controle_holograma(self, mao, dimensoes_frame):
-        distancia_pinca = max(
-            ((mao[4].x - mao[8].x) ** 2 + (mao[4].y - mao[8].y) ** 2) ** 0.5,
-            0.001
-        )
-        pinca_ativa = distancia_pinca < 0.16
-
-        if not pinca_ativa:
-            self.mao_segura_holograma = False
-            self.centro_mao_anterior = None
-            self.distancia_mao_anterior = None
-            return
-
-        centro_x = mao[8].x
-        centro_y = mao[8].y
-
-        if self.centro_mao_anterior is not None:
-            delta_x = centro_x - self.centro_mao_anterior[0]
-            delta_y = centro_y - self.centro_mao_anterior[1]
-            self.holograma_rotacao_y = (self.holograma_rotacao_y + delta_x * 720) % 360
-            self.holograma_rotacao_x = (self.holograma_rotacao_x + delta_y * 360) % 360
-
-        if self.distancia_mao_anterior is not None:
-            variacao = distancia_pinca / self.distancia_mao_anterior
-            self.holograma_escala = max(
-                0.55,
-                min(2.2, self.holograma_escala * variacao)
-            )
-
-        self.mao_segura_holograma = True
-        self.centro_mao_anterior = (centro_x, centro_y)
-        self.distancia_mao_anterior = distancia_pinca
-
     def desenhar_holograma_67(self, frame):
         altura, largura = frame.shape[:2]
         centro_x = largura // 2
@@ -1562,19 +1559,6 @@ class JanelaJarvis(QMainWindow):
             int(centro_x + x * 115 * escala * perspectiva),
             int(centro_y + y * 115 * escala * perspectiva)
         )
-
-    def detectar_movimento(self, frame):
-        cinza = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        cinza = cv2.GaussianBlur(cinza, (21, 21), 0)
-
-        if self.frame_anterior is None:
-            self.frame_anterior = cinza
-            return False
-
-        diferenca = cv2.absdiff(self.frame_anterior, cinza)
-        self.frame_anterior = cinza
-        _, mascara = cv2.threshold(diferenca, 25, 255, cv2.THRESH_BINARY)
-        return cv2.countNonZero(mascara) > frame.shape[0] * frame.shape[1] * 0.025
 
     def desenhar_rosto(self, frame, deteccoes):
         altura, largura = frame.shape[:2]
@@ -1677,7 +1661,10 @@ class JanelaJarvis(QMainWindow):
             cv2.putText(frame, f"Gesto: {comando}", (18, 34), cv2.FONT_HERSHEY_DUPLEX, 0.7, (120, 240, 255), 1, cv2.LINE_AA)
 
     def scroll_page(self, quantidade):
-        self.enviar_tecla_windows("{PGUP}" if quantidade > 0 else "{PGDN}")
+        self.enviar_tecla_windows(
+            "{PGUP}" if quantidade > 0 else "{PGDN}",
+            repeticoes=min(4, max(1, abs(int(quantidade)) // 2)),
+        )
 
     def navegar_historico(self, direcao):
         self.enviar_tecla_windows("%{LEFT}" if direcao == "voltar" else "%{RIGHT}")
@@ -1685,9 +1672,51 @@ class JanelaJarvis(QMainWindow):
     def alternar_reproducao(self):
         self.enviar_tecla_windows("{SPACE}")
 
-    def enviar_tecla_windows(self, tecla):
-        comando = f"$wshell = New-Object -ComObject WScript.Shell; $wshell.SendKeys('{tecla}')"
-        subprocess.Popen(["powershell.exe", "-NoProfile", "-Command", comando], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+    def enviar_tecla_windows(self, tecla, repeticoes=1):
+        """Envia a tecla direto pelo Windows, sem abrir um PowerShell por gesto.
+
+        Antes, cada gesto de mão abria um processo `powershell.exe` para usar
+        `WScript.Shell.SendKeys` — centenas de milissegundos de atraso, um
+        processo novo a cada gesto, e o atalho ia para **qualquer** janela em
+        foco. Agora é a mesma técnica das teclas de mídia do main.py
+        (`keybd_event`), sem criar processo nenhum.
+        """
+
+        if os.name != "nt":
+            log.warning("Teclas de gesto não existem neste sistema (%s)", tecla)
+            return False
+
+        alt = tecla.startswith("%")
+        nome = tecla.replace("%", "").strip("{}").upper()
+        codigo = CODIGOS_DE_TECLA.get(nome)
+
+        if codigo is None:
+            log.warning("Tecla de gesto desconhecida: %r", tecla)
+            return False
+
+        try:
+            usuario32 = ctypes.WinDLL("user32", use_last_error=True)
+        except Exception:
+            log.exception("Não consegui acessar a API de teclado do Windows")
+            return False
+
+        try:
+            for _ in range(max(1, int(repeticoes))):
+                if alt:
+                    usuario32.keybd_event(CODIGOS_DE_TECLA["ALT"], 0, 0, 0)
+
+                usuario32.keybd_event(codigo, 0, 0, 0)
+                usuario32.keybd_event(codigo, 0, 2, 0)
+
+                if alt:
+                    usuario32.keybd_event(CODIGOS_DE_TECLA["ALT"], 0, 2, 0)
+
+                time.sleep(0.02)
+
+            return True
+        except Exception:
+            log.exception("Falha ao enviar a tecla de gesto %r", tecla)
+            return False
 
     def desenhar_mao(self, frame, mao):
         altura, largura = frame.shape[:2]
@@ -1786,9 +1815,11 @@ class JanelaJarvis(QMainWindow):
         reprocessava o arquivo inteiro (que só cresce) duas vezes por segundo.
         """
 
+        caminho = ARQUIVO_MEMORIA if ARQUIVO_MEMORIA.exists() else ARQUIVO_MEMORIA_LEGADO
+
         try:
-            estado = ARQUIVO_MEMORIA.stat()
-            assinatura = (estado.st_mtime_ns, estado.st_size)
+            estado = caminho.stat()
+            assinatura = (estado.st_mtime_ns, estado.st_size, caminho.name)
         except OSError:
             self._memoria_cache = []
             self._memoria_assinatura = None
@@ -1797,7 +1828,7 @@ class JanelaJarvis(QMainWindow):
         if getattr(self, "_memoria_assinatura", None) == assinatura:
             return self._memoria_cache
 
-        dados = ler_json(ARQUIVO_MEMORIA, [])
+        dados = ler_jsonl(ARQUIVO_MEMORIA) if ARQUIVO_MEMORIA.exists() else ler_json(ARQUIVO_MEMORIA_LEGADO, [])
         self._memoria_cache = (
             [item for item in dados if isinstance(item, dict)]
             if isinstance(dados, list)
@@ -1854,7 +1885,7 @@ class JanelaJarvis(QMainWindow):
         texto, confirmou = QInputDialog.getText(
             self,
             "Gerar imagem",
-            "Descreva a imagem:"
+            "Descreva a imagem ou o tema da busca:"
         )
 
         if confirmou and texto.strip():

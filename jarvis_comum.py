@@ -169,6 +169,63 @@ def escrever_json_atomico(caminho: Path, dados) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Histórico em uma linha por registro (JSONL)
+# ---------------------------------------------------------------------------
+#
+# O histórico da conversa era uma lista JSON reescrita por inteiro a cada
+# mensagem — com milhares de registros, isso fica lento e passa pela janela
+# em que o arquivo está truncado (a interface lia e via "sem mensagens").
+# Aqui cada mensagem vira uma linha anexada, com rotação por tamanho.
+
+TAMANHO_MAXIMO_DO_HISTORICO = 8 * 1024 * 1024
+
+
+def ler_jsonl(caminho: Path, limite: int | None = None) -> list:
+    """Lê um arquivo de uma linha por registro, ignorando linhas quebradas."""
+
+    registros = []
+
+    try:
+        with open(caminho, "r", encoding="utf-8", errors="replace") as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+
+                if not linha:
+                    continue
+
+                try:
+                    registros.append(json.loads(linha))
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+
+    if limite:
+        return registros[-limite:]
+
+    return registros
+
+
+def anexar_jsonl(caminho: Path, registro: dict, tamanho_maximo: int = TAMANHO_MAXIMO_DO_HISTORICO) -> bool:
+    """Anexa um registro, trocando o arquivo de lugar quando fica grande."""
+
+    caminho = Path(caminho)
+
+    try:
+        if caminho.exists() and caminho.stat().st_size >= tamanho_maximo:
+            os.replace(caminho, caminho.with_suffix(caminho.suffix + ".1"))
+
+        with open(caminho, "a", encoding="utf-8") as arquivo:
+            arquivo.write(json.dumps(registro, ensure_ascii=False) + "\n")
+
+        return True
+    except OSError:
+        return False
+
+
 class FilaDeArquivos:
     """Fila de mensagens simples e segura entre processos.
 

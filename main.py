@@ -6,7 +6,6 @@ import os
 import shutil
 import subprocess
 import time
-import unicodedata
 
 from datetime import datetime
 from pathlib import Path
@@ -22,12 +21,20 @@ from PIL import Image
 
 from jarvis_audio import DetectorDeVoz, ThreadOuvinte
 from jarvis_comum import (
+    anexar_jsonl,
     configurar_log,
     consumir_comandos,
     escrever_json_atomico,
     ler_json,
+    ler_jsonl,
     publicar_evento,
     registrar_excecoes_nao_tratadas,
+)
+from jarvis_intencoes import (
+    descrever as descrever_intencao,
+    normalizar,
+    quer_ligar,
+    reconhecer,
 )
 from jarvis_voz import GerenciadorDeVoz
 
@@ -60,7 +67,12 @@ TEMPO_DE_ESPERA_POR_RESPOSTA = 8.0
 INTERVALO_DE_STATUS = 2.0
 
 PASTA = Path(__file__).resolve().parent
-ARQUIVO_MEMORIA = PASTA / "memoria_jarvis.json"
+ARQUIVO_MEMORIA = PASTA / "memoria_jarvis.jsonl"
+ARQUIVO_MEMORIA_LEGADO = PASTA / "memoria_jarvis.json"
+
+# Quantos registros ficam na memória do processo (a conversa recente basta) e
+# a partir de que tamanho o arquivo do histórico é trocado.
+MEMORIAS_EM_RAM = 2000
 ARQUIVO_CONFIG = PASTA / "config_jarvis.json"
 ARQUIVO_COMANDOS_APRENDIDOS = PASTA / "comandos_aprendidos.json"
 
@@ -105,6 +117,7 @@ def localizar_ollama():
 CAMINHO_OLLAMA = localizar_ollama()
 
 clique_pendente = None
+intencao_pendente = None
 processo_fala = None
 tempo_ultima_fala = None
 programa_ativo = True
@@ -151,13 +164,46 @@ def filtro_de_palavroes_ativado():
     return carregar_config()["filtro_palavroes_ativado"]
 
 
-def carregar_memoria():
-    dados = ler_json(ARQUIVO_MEMORIA, [])
+def migrar_memoria_legada():
+    """Converte o antigo memoria_jarvis.json (lista) no formato de linhas.
+
+    O arquivo antigo é mantido como estava — serve de cópia de segurança.
+    """
+
+    if ARQUIVO_MEMORIA.exists() or not ARQUIVO_MEMORIA_LEGADO.exists():
+        return 0
+
+    dados = ler_json(ARQUIVO_MEMORIA_LEGADO, [])
+
     if not isinstance(dados, list):
-        return []
-    return [item for item in dados if isinstance(item, dict)]
+        return 0
+
+    quantos = 0
+
+    for item in dados:
+        if isinstance(item, dict) and anexar_jsonl(ARQUIVO_MEMORIA, item):
+            quantos += 1
+
+    if quantos:
+        log.info(
+            "Memória convertida para %s (%d registros; o .json antigo ficou de cópia)",
+            ARQUIVO_MEMORIA.name,
+            quantos,
+        )
+
+    return quantos
 
 
+def carregar_memoria(limite=MEMORIAS_EM_RAM):
+    """Lê os registros mais recentes do histórico."""
+
+    return [
+        item for item in ler_jsonl(ARQUIVO_MEMORIA, limite)
+        if isinstance(item, dict)
+    ]
+
+
+migrar_memoria_legada()
 memoria = carregar_memoria()
 
 
@@ -221,20 +267,27 @@ def aprender_comando(comando_normalizado):
 
 
 def registrar_memoria(tipo, texto):
-    """Grava uma linha da conversa.
+    """Anexa uma linha no histórico.
 
-    A escrita é atômica: antes, a interface podia ler o arquivo no instante em
-    que ele estava truncado e exibir "Ainda não há mensagens" por um segundo,
-    além do risco de perder registros.
+    Antes, cada mensagem reescrevia o arquivo inteiro (que só cresce): com o
+    uso, cada frase ficava mais lenta e a interface podia ler o arquivo no
+    instante em que ele estava truncado. Agora é só um anexo — e o arquivo é
+    trocado de lugar quando passa de 8 MB.
     """
 
-    memoria.append({
+    registro = {
         "data": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "tipo": tipo,
-        "texto": texto
-    })
+        "texto": texto,
+    }
 
-    if not escrever_json_atomico(ARQUIVO_MEMORIA, memoria):
+    memoria.append(registro)
+
+    # A conversa em memória não precisa crescer sem limite.
+    if len(memoria) > MEMORIAS_EM_RAM:
+        del memoria[:-MEMORIAS_EM_RAM]
+
+    if not anexar_jsonl(ARQUIVO_MEMORIA, registro):
         log.error("Não consegui gravar a memória em %s", ARQUIVO_MEMORIA)
 
 
@@ -356,20 +409,8 @@ def falar(texto):
     )
 
 
-def normalizar(texto):
-    texto = unicodedata.normalize("NFD", texto.lower())
-
-    texto = "".join(
-        letra for letra in texto
-        if unicodedata.category(letra) != "Mn"
-    )
-
-    texto = "".join(
-        letra if letra.isalnum() else " "
-        for letra in texto
-    )
-
-    return " ".join(texto.split())
+# `normalizar` agora vive em jarvis_intencoes (importada acima), junto com o
+# resto do entendimento da fala — uma implementação só, testada uma vez.
 
 
 def extrair_comando_apos_ativacao(frase):
@@ -1074,9 +1115,11 @@ def processar_comando(comando, profundidade=0):
         falar(f"Executando o comando aprendido: {comando_normalizado}.")
         return processar_comando(acao_aprendida, profundidade + 1)
 
-    if comando_normalizado in ["sair", "fechar jarvis", "encerrar jarvis"]:
-        falar("Até logo!")
-        return False
+    # Uma confirmação já estava esperando resposta?
+    resposta_pendente = tratar_intencao_pendente(comando_normalizado)
+
+    if resposta_pendente is not None:
+        return resposta_pendente
 
     if clique_pendente is not None and comando_normalizado in [
         "sim",
@@ -1089,85 +1132,213 @@ def processar_comando(comando, profundidade=0):
 
     if clique_pendente is not None and comando_normalizado in [
         "nao",
-        "não",
         "cancelar",
         "cancelar clique"
     ]:
         cancelar_clique()
         return True
 
-    if (
-        "ler minha tela" in comando_normalizado or
-        "descrever minha tela" in comando_normalizado or
-        "descreva minha tela" in comando_normalizado or
-        "o que tem na minha tela" in comando_normalizado
-    ):
-        descrever_tela_com_ollama()
+    intencao = reconhecer(comando)
+
+    if intencao is None or intencao.nome in ("confirmar", "cancelar"):
+        # Conversa livre (ou um "sim" sem nada pendente): vai para a IA local.
+        informar_interface("estado_voz", {"processando": True, "motivo": "consultando a IA local"})
+        responder_com_ollama(comando)
         return True
 
-    if comando_normalizado.startswith("clicar em "):
-        texto = comando_normalizado.replace("clicar em ", "", 1).strip()
-        preparar_clique(texto)
+    if intencao.precisa_confirmar:
+        return pedir_confirmacao(intencao)
+
+    return executar_intencao(intencao)
+
+
+def pedir_confirmacao(intencao):
+    """Frase parecida com um comando: pergunta antes de agir."""
+
+    global intencao_pendente
+
+    intencao_pendente = intencao
+    descricao = descrever_intencao(intencao)
+
+    log.info(
+        "Pedindo confirmação: %s (confiança %.2f, ouvido %r)",
+        descricao,
+        intencao.confianca,
+        intencao.frase,
+    )
+
+    falar(f"Você quis dizer: {descricao}? Diga sim para eu fazer.")
+    informar_interface(
+        "aviso",
+        {"nivel": "info", "texto": f"Esperando confirmação para {descricao}"},
+    )
+    return True
+
+
+def tratar_intencao_pendente(comando_normalizado):
+    """Responde ao sim/não de uma intenção aguardando confirmação.
+
+    Devolve ``None`` quando não há nada pendente — aí o comando novo segue o
+    fluxo normal, sem ficar preso esperando uma resposta que não vem.
+    """
+
+    global intencao_pendente
+
+    if intencao_pendente is None:
+        return None
+
+    intencao = intencao_pendente
+
+    if comando_normalizado in [
+        "sim", "confirmar", "confirmo", "isso", "pode", "pode sim",
+        "claro", "beleza", "ok", "esta certo", "tudo bem",
+    ]:
+        intencao_pendente = None
+        log.info("Usuário confirmou: %s", intencao.nome)
+        return executar_intencao(intencao)
+
+    if comando_normalizado in [
+        "nao", "cancelar", "deixa", "deixa pra la", "nao quero", "errado",
+    ]:
+        intencao_pendente = None
+        falar("Tudo bem, não vou fazer.")
         return True
 
-    if "que horas" in comando_normalizado or comando_normalizado == "hora":
-        hora = datetime.now().strftime("%H:%M")
-        falar(f"Agora são {hora}.")
+    intencao_pendente = None
+    return None
+
+
+def gerar_imagem(descricao):
+    """Trata o botão "Gerar imagem" do painel.
+
+    O Jarvis não tem gerador de imagens. Antes, o pedido caía no modelo de
+    linguagem e sumia sem resposta. Agora ele é honesto e útil: abre uma
+    busca de imagens com a descrição.
+    """
+
+    descricao = normalizar(descricao)
+
+    for inicio in ("gerar imagem", "criar imagem", "fazer uma imagem", "desenhar", "gerar"):
+        if descricao.startswith(inicio):
+            descricao = descricao[len(inicio):].strip()
+            break
+
+    if not descricao:
+        falar("Diga o que você quer na imagem.")
+        return
+
+    log.info("Pedido de imagem (recurso não disponível): %r", descricao)
+    navegar_no_painel(
+        "https://www.google.com/search?tbm=isch&q=" + quote_plus(descricao)
+    )
+    falar(
+        f"Ainda não sei gerar imagens. Abri uma busca de imagens sobre {descricao}."
+    )
+
+
+def executar_intencao(intencao):
+    """Executa o comando entendido. Devolve False só quando é para encerrar."""
+
+    nome = intencao.nome
+    frase = intencao.frase or ""
+    argumento = intencao.argumento or ""
+
+    log.info("Executando intenção %s (confiança %.2f)", nome, intencao.confianca)
+
+    try:
+        if nome == "sair":
+            falar("Até logo!")
+            return False
+
+        if nome == "hora":
+            falar(f"Agora são {datetime.now().strftime('%H:%M')}.")
+            return True
+
+        if nome == "aprender":
+            aprender_comando(frase)
+            return True
+
+        if nome == "descrever_tela":
+            descrever_tela_com_ollama()
+            return True
+
+        if nome == "corrigir_e_colar":
+            corrigir_texto_copiado(colar_depois=True)
+            return True
+
+        if nome == "corrigir_texto":
+            corrigir_texto_copiado(colar_depois=False)
+            return True
+
+        if nome == "esconder_painel":
+            informar_interface("esconder_painel", {})
+            falar("Escondendo o painel. Para abrir de novo, use o ícone perto do relógio.")
+            return True
+
+        if nome == "holograma":
+            ligar = quer_ligar(intencao)
+            informar_interface("mostrar_holograma", {"visivel": ligar})
+            falar("Holograma ligado." if ligar else "Holograma desligado.")
+            return True
+
+        if nome == "camera":
+            ligar = quer_ligar(intencao)
+            informar_interface("definir_camera", {"ativada": ligar})
+            falar("Câmera ligada." if ligar else "Câmera desligada.")
+            return True
+
+        if nome == "musica_controle":
+            controlar_musica(frase)
+            return True
+
+        if nome == "abrir_youtube_music":
+            navegar_no_painel("https://music.youtube.com")
+            falar("Abrindo o YouTube Music.")
+            return True
+
+        if nome == "abrir_navegador":
+            navegar_no_painel("https://www.google.com")
+            falar("Abrindo o navegador.")
+            return True
+
+        if nome == "tocar_musica":
+            if "youtube music" in frase or "youtube musica" in frase:
+                tocar_no_youtube_music(frase)
+            else:
+                tocar_no_youtube(frase)
+            return True
+
+        if nome == "pesquisar":
+            pesquisar_na_internet(frase)
+            return True
+
+        if nome == "clicar_em":
+            if not argumento:
+                falar("Diga em que devo clicar.")
+                return True
+
+            preparar_clique(argumento)
+            return True
+
+        if nome == "gerar_imagem":
+            gerar_imagem(argumento or frase)
+            return True
+
+        if nome == "abrir_aplicativo":
+            if not argumento:
+                falar("Diga o nome do programa que devo abrir.")
+                return True
+
+            abrir_aplicativo(argumento)
+            return True
+
+    except Exception:
+        log.exception("Falha ao executar a intenção %s (frase %r)", nome, frase)
+        falar("Não consegui fazer isso agora.")
         return True
 
-    if "corrigir e colar" in comando_normalizado or "corrija e cole" in comando_normalizado:
-        corrigir_texto_copiado(colar_depois=True)
-        return True
-
-    if "corrigir texto copiado" in comando_normalizado or "corrija texto copiado" in comando_normalizado:
-        corrigir_texto_copiado(colar_depois=False)
-        return True
-
-    if controlar_musica(comando_normalizado):
-        return True
-
-    if comando_normalizado in ["abrir youtube music", "abrir youtube musica"]:
-        navegar_no_painel("https://music.youtube.com")
-        falar("Abrindo o YouTube Music.")
-        return True
-
-    comandos_musica = ("tocar", "toque", "colocar", "coloque")
-    if (
-        any(comando_normalizado.startswith(item) for item in comandos_musica) and
-        ("youtube music" in comando_normalizado or "you tube music" in comando_normalizado or
-         "musica" in comando_normalizado)
-    ):
-        tocar_no_youtube_music(comando_normalizado)
-        return True
-
-    if (
-        any(comando_normalizado.startswith(item) for item in comandos_musica) and
-        ("youtube" in comando_normalizado or "you tube" in comando_normalizado)
-    ):
-        tocar_no_youtube(comando_normalizado)
-        return True
-
-    if comando_normalizado in ["abrir navegador", "abrir o navegador"]:
-        navegar_no_painel("https://www.google.com")
-        falar("Abrindo o navegador.")
-        return True
-
-    if (
-        comando_normalizado.startswith("pesquisar") or
-        comando_normalizado.startswith("pesquise") or
-        comando_normalizado.startswith("procure") or
-        comando_normalizado.startswith("buscar")
-    ):
-        pesquisar_na_internet(comando_normalizado)
-        return True
-
-    if comando_normalizado.startswith("abrir "):
-        nome_aplicativo = comando_normalizado.replace("abrir ", "", 1).strip()
-        abrir_aplicativo(nome_aplicativo)
-        return True
-
-    informar_interface("estado_voz", {"processando": True, "motivo": "consultando a IA local"})
-    responder_com_ollama(comando)
+    log.warning("Intenção sem tratamento: %r", nome)
+    responder_com_ollama(frase)
     return True
 
 

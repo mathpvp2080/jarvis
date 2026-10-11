@@ -219,6 +219,8 @@ __marimo__/
 
 # --- Jarvis: dados de execução (não versionar) ---
 jarvis.log
+memoria_jarvis.jsonl
+memoria_jarvis.jsonl.1
 jarvis.log.*
 dados_navegador/
 fila_comandos/
