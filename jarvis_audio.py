@@ -19,6 +19,7 @@ principal e entrega frases completas numa fila.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import queue
 import threading
@@ -459,8 +460,9 @@ def escolher_microfone(config: dict | None = None) -> tuple[int | None, str]:
     config = config or {}
     preferido = config.get("microfone")
 
+    # Checagem de disponibilidade sem manter o módulo num nome não usado.
     try:
-        import sounddevice as sd
+        importlib.import_module("sounddevice")
     except Exception as erro:
         return None, f"sounddevice indisponível ({erro})"
 
