@@ -1,101 +1,160 @@
-﻿import base64
+﻿import atexit
+import base64
 import ctypes
 import difflib
 import json
 import os
-import queue
 import shutil
 import subprocess
 import time
-import unicodedata
-import webbrowser
 
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
 import mss
-import numpy as np
 import pyautogui
 import pyperclip
 import pytesseract
-import sounddevice as sd
-import speech_recognition as sr
 
 from PIL import Image
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
-
-mutex = ctypes.windll.kernel32.CreateMutexW(
-    None,
-    False,
-    "JarvisAssistenteDeVozUnica"
+from jarvis_audio import DetectorDeVoz, ThreadOuvinte
+from jarvis_comum import (
+    anexar_jsonl,
+    configurar_log,
+    consumir_comandos,
+    escrever_json_atomico,
+    ler_json,
+    ler_jsonl,
+    publicar_evento,
+    registrar_excecoes_nao_tratadas,
 )
+from jarvis_intencoes import (
+    descrever as descrever_intencao,
+    normalizar,
+    quer_ligar,
+    reconhecer,
+)
+from jarvis_tts import MotorDeFala
+from jarvis_voz import GerenciadorDeVoz
 
-if ctypes.windll.kernel32.GetLastError() == 183:
-    print("A Jarvis já está aberta. Feche a outra janela antes de iniciar novamente.")
-    raise SystemExit
+log = configurar_log("jarvis")
+registrar_excecoes_nao_tratadas(log)
+
+# `queue` e `speech_recognition` deixaram de ser usados aqui: a captura de
+# áudio passou para jarvis_audio (com thread própria) e o reconhecimento
+# para jarvis_voz (com motores de reserva). O selenium saiu junto com a
+# função de automação que ninguém chamava.
+
+CRIAR_SEM_JANELA = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-TAXA_DE_AUDIO = 16000
-LIMIAR_MINIMO_DE_VOZ = 120
-MULTIPLICADOR_DE_RUIDO = 1.8
-SILENCIO_PARA_ENCERRAR = 1.1
-TEMPO_MAXIMO_DE_FALA = 20
-TEMPO_MAXIMO_DE_ESPERA = 60
+if os.name == "nt":
+    # Trava de instância única (só faz sentido no Windows).
+    ctypes.windll.kernel32.CreateMutexW(None, False, "JarvisAssistenteDeVozUnica")
+
+    if ctypes.windll.kernel32.GetLastError() == 183:
+        print("A Jarvis já está aberta. Feche a outra janela antes de iniciar novamente.")
+        raise SystemExit
+
+
+# Parâmetros de áudio de reserva: o detector em jarvis_audio tem os seus
+# próprios (e adaptativos). Estes são usados só em `criar_detector_de_voz`,
+# que traduz a configuração do painel para o detector.
 SESSAO_CONVERSA = 30
 TEMPO_COOLDOWN_FALA = 0.8
+TEMPO_DE_ESPERA_POR_RESPOSTA = 8.0
+INTERVALO_DE_STATUS = 2.0
 
 PASTA = Path(__file__).resolve().parent
-ARQUIVO_MEMORIA = PASTA / "memoria_jarvis.json"
+ARQUIVO_MEMORIA = PASTA / "memoria_jarvis.jsonl"
+ARQUIVO_MEMORIA_LEGADO = PASTA / "memoria_jarvis.json"
+
+# Quantos registros ficam na memória do processo (a conversa recente basta) e
+# a partir de que tamanho o arquivo do histórico é trocado.
+MEMORIAS_EM_RAM = 2000
 ARQUIVO_CONFIG = PASTA / "config_jarvis.json"
 ARQUIVO_COMANDOS_APRENDIDOS = PASTA / "comandos_aprendidos.json"
-ARQUIVO_COMANDOS_INTERFACE = PASTA / "comandos_interface.json"
-ARQUIVO_EVENTOS_INTERFACE = PASTA / "eventos_interface.json"
 
 CAMINHO_TESSERACT = shutil.which("tesseract") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 pytesseract.pytesseract.tesseract_cmd = CAMINHO_TESSERACT
 
-reconhecedor = sr.Recognizer()
-reconhecedor.pause_threshold = 1.2
-reconhecedor.non_speaking_duration = 0.4
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 MODELO_LOCAL = "qwen2.5:3b"
-CAMINHO_OLLAMA = Path(
-    os.environ.get(
-        "OLLAMA_EXECUTABLE",
-        r"C:\Users\Matheus\AppData\Local\Programs\Ollama\ollama.exe"
-    )
-)
+TEMPO_DE_RESPOSTA_DO_OLLAMA = 60
+
+
+def localizar_ollama():
+    r"""Procura o Ollama de verdade, em vez de confiar num caminho fixo.
+
+    Antes o caminho era fixo em \Users\Matheus\... — se o Ollama estivesse
+    em outro lugar (ou a pessoa usasse outro usuário do Windows), toda
+    resposta de IA falhava com "verifique se o Ollama está instalado".
+    """
+
+    do_ambiente = os.environ.get("OLLAMA_EXECUTABLE", "").strip()
+    if do_ambiente and Path(do_ambiente).exists():
+        return Path(do_ambiente)
+
+    encontrado = shutil.which("ollama")
+    if encontrado:
+        return Path(encontrado)
+
+    candidatos = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Ollama" / "ollama.exe",
+        Path("/usr/local/bin/ollama"),
+        Path("/usr/bin/ollama"),
+    ]
+    for candidato in candidatos:
+        if candidato.exists():
+            return candidato
+
+    return None
+
+
+CAMINHO_OLLAMA = localizar_ollama()
 
 clique_pendente = None
+intencao_pendente = None
 processo_fala = None
+motor_de_fala = None
+tempo_ultima_fala = None
+programa_ativo = True
+modo_conversa_ate = 0.0
+ouvinte = None
+gerenciador_voz = None
 voz_windows = None
 voz_windows_carregada = False
+ultimo_status_voz = 0.0
 
 
 def carregar_config():
     padrao = {
         "visualizacao_de_tela_ativada": False,
-        "filtro_palavroes_ativado": False
+        "filtro_palavroes_ativado": False,
+        "camera_ativada": True,
+        "bloquear_ao_sair": False,
+        "detectar_emocoes": True,
+        "exoesqueleto_facial": True,
+        "holograma_ativado": True,
+        "reagir_a_gestos": True,
+        # Áudio / voz
+        "microfone": "",
+        "motor_de_voz": "",
+        "modelo_whisper": "small",
+        "pasta_modelo_vosk": "",
+        "limiar_minimo_de_voz": 45,
+        "multiplicador_de_ruido": 1.8,
+        "silencio_para_encerrar": 1.0,
     }
 
-    try:
-        if ARQUIVO_CONFIG.exists():
-            dados = json.loads(ARQUIVO_CONFIG.read_text(encoding="utf-8"))
-
-            if isinstance(dados, dict):
-                padrao.update(dados)
-    except (json.JSONDecodeError, OSError):
-        pass
+    dados = ler_json(ARQUIVO_CONFIG, {})
+    if isinstance(dados, dict):
+        padrao.update(dados)
 
     return padrao
 
@@ -108,19 +167,46 @@ def filtro_de_palavroes_ativado():
     return carregar_config()["filtro_palavroes_ativado"]
 
 
-def carregar_memoria():
-    if not ARQUIVO_MEMORIA.exists():
-        return []
+def migrar_memoria_legada():
+    """Converte o antigo memoria_jarvis.json (lista) no formato de linhas.
 
-    try:
-        dados = json.loads(ARQUIVO_MEMORIA.read_text(encoding="utf-8"))
-        if not isinstance(dados, list):
-            return []
-        return [item for item in dados if isinstance(item, dict)]
-    except (json.JSONDecodeError, OSError):
-        return []
+    O arquivo antigo é mantido como estava — serve de cópia de segurança.
+    """
+
+    if ARQUIVO_MEMORIA.exists() or not ARQUIVO_MEMORIA_LEGADO.exists():
+        return 0
+
+    dados = ler_json(ARQUIVO_MEMORIA_LEGADO, [])
+
+    if not isinstance(dados, list):
+        return 0
+
+    quantos = 0
+
+    for item in dados:
+        if isinstance(item, dict) and anexar_jsonl(ARQUIVO_MEMORIA, item):
+            quantos += 1
+
+    if quantos:
+        log.info(
+            "Memória convertida para %s (%d registros; o .json antigo ficou de cópia)",
+            ARQUIVO_MEMORIA.name,
+            quantos,
+        )
+
+    return quantos
 
 
+def carregar_memoria(limite=MEMORIAS_EM_RAM):
+    """Lê os registros mais recentes do histórico."""
+
+    return [
+        item for item in ler_jsonl(ARQUIVO_MEMORIA, limite)
+        if isinstance(item, dict)
+    ]
+
+
+migrar_memoria_legada()
 memoria = carregar_memoria()
 
 
@@ -149,10 +235,8 @@ comandos_aprendidos = carregar_comandos_aprendidos()
 
 
 def salvar_comandos_aprendidos():
-    ARQUIVO_COMANDOS_APRENDIDOS.write_text(
-        json.dumps(comandos_aprendidos, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    if not escrever_json_atomico(ARQUIVO_COMANDOS_APRENDIDOS, comandos_aprendidos):
+        log.error("Não consegui salvar os comandos aprendidos")
 
 
 def aprender_comando(comando_normalizado):
@@ -186,66 +270,54 @@ def aprender_comando(comando_normalizado):
 
 
 def registrar_memoria(tipo, texto):
-    memoria.append({
+    """Anexa uma linha no histórico.
+
+    Antes, cada mensagem reescrevia o arquivo inteiro (que só cresce): com o
+    uso, cada frase ficava mais lenta e a interface podia ler o arquivo no
+    instante em que ele estava truncado. Agora é só um anexo — e o arquivo é
+    trocado de lugar quando passa de 8 MB.
+    """
+
+    registro = {
         "data": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "tipo": tipo,
-        "texto": texto
-    })
+        "texto": texto,
+    }
 
-    ARQUIVO_MEMORIA.write_text(
-        json.dumps(memoria, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    memoria.append(registro)
+
+    # A conversa em memória não precisa crescer sem limite.
+    if len(memoria) > MEMORIAS_EM_RAM:
+        del memoria[:-MEMORIAS_EM_RAM]
+
+    if not anexar_jsonl(ARQUIVO_MEMORIA, registro):
+        log.error("Não consegui gravar a memória em %s", ARQUIVO_MEMORIA)
 
 
 def ler_comandos_interface():
-    if not ARQUIVO_COMANDOS_INTERFACE.exists():
-        return []
+    """Comandos vindos do painel.
 
-    try:
-        comandos = json.loads(
-            ARQUIVO_COMANDOS_INTERFACE.read_text(encoding="utf-8")
-        )
-    except (json.JSONDecodeError, OSError):
-        return []
-
-    if not isinstance(comandos, list):
-        return []
-
-    try:
-        ARQUIVO_COMANDOS_INTERFACE.write_text("[]", encoding="utf-8")
-    except OSError:
-        pass
+    Cada comando é um arquivo próprio numa fila (jarvis_comum), então nada
+    some se o painel escrever no exato momento em que o Jarvis lê — o que
+    acontecia com o antigo `comandos_interface.json`.
+    """
 
     return [
-        item.get("texto", "").strip()
-        for item in comandos
-        if isinstance(item, dict) and item.get("texto", "").strip()
+        str(item.get("texto", "")).strip()
+        for item in consumir_comandos()
+        if isinstance(item, dict) and str(item.get("texto", "")).strip()
     ]
 
 
-def registrar_evento_interface(tipo, dados=None):
-    eventos = []
+def informar_interface(tipo, dados=None):
+    """Manda um recado para o painel (aviso, estado da voz, navegação...)."""
 
-    if ARQUIVO_EVENTOS_INTERFACE.exists():
-        try:
-            conteudo = json.loads(
-                ARQUIVO_EVENTOS_INTERFACE.read_text(encoding="utf-8")
-            )
-            if isinstance(conteudo, list):
-                eventos = conteudo
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    eventos.append({"tipo": tipo, "dados": dados or {}})
-    ARQUIVO_EVENTOS_INTERFACE.write_text(
-        json.dumps(eventos, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    if not publicar_evento(tipo, dados):
+        log.warning("Não consegui avisar a interface: %s", tipo)
 
 
 def navegar_no_painel(url):
-    registrar_evento_interface("navegar_navegador", {"url": url})
+    informar_interface("navegar_navegador", {"url": url})
 
 
 def obter_voz_disponivel():
@@ -307,18 +379,48 @@ def selecionar_voz_windows():
 
 
 def falar(texto):
-    global processo_fala, tempo_ultima_fala
+    """Fala uma frase.
+
+    O caminho normal é o motor persistente (jarvis_tts): um único processo de
+    fala para toda a sessão. Se ele não estiver disponível (fora do Windows,
+    PowerShell bloqueado, voz ausente), cai no processo único por frase — o
+    comportamento antigo — para nunca ficar muda.
+    """
+
+    global motor_de_fala, processo_fala, tempo_ultima_fala
 
     print(f"Jarvis: {texto}")
     registrar_memoria("Jarvis", texto)
     tempo_ultima_fala = time.monotonic()
+
+    if os.name != "nt":
+        # Fora do Windows não existe System.Speech: o texto sai no console.
+        log.info("(voz indisponível neste sistema) %s", texto)
+        return
+
+    if motor_de_fala is None:
+        motor_de_fala = MotorDeFala(logger=log, voz=selecionar_voz_windows())
+        atexit.register(motor_de_fala.fechar)
+
+    if motor_de_fala.falar(texto):
+        return
+
+    log.warning(
+        "Motor de fala persistente indisponível (%s); usando o modo antigo",
+        motor_de_fala.ultimo_erro,
+    )
+    processo_fala = _falar_em_processo_unico(texto)
+
+
+def _falar_em_processo_unico(texto):
+    """Reserva: um PowerShell por frase (antes era o único caminho)."""
 
     voz = selecionar_voz_windows()
 
     comando_powershell = (
         "Add-Type -AssemblyName System.Speech; "
         "$voz = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-        f"$voz.Rate = 1; $voz.Volume = 100; "
+        "$voz.Rate = 1; $voz.Volume = 100; "
         + (f"$voz.SelectVoice('{voz}'); " if voz else "")
         + f"$voz.Speak({json.dumps(texto, ensure_ascii=False)})"
     )
@@ -326,29 +428,30 @@ def falar(texto):
         comando_powershell.encode("utf-16le")
     ).decode("ascii")
 
-    processo_fala = subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-EncodedCommand", comando_codificado],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
+    try:
+        return subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-EncodedCommand", comando_codificado],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=CRIAR_SEM_JANELA,
+        )
+    except (FileNotFoundError, OSError) as erro:
+        log.error("Nem o modo antigo de fala funcionou: %s", erro)
+        return None
 
 
-def normalizar(texto):
-    texto = unicodedata.normalize("NFD", texto.lower())
+def esta_falando():
+    """A Jarvis está falando agora? (motor persistente ou processo único)"""
 
-    texto = "".join(
-        letra for letra in texto
-        if unicodedata.category(letra) != "Mn"
-    )
+    if motor_de_fala is not None and motor_de_fala.falando():
+        return True
 
-    texto = "".join(
-        letra if letra.isalnum() else " "
-        for letra in texto
-    )
+    return processo_fala is not None and processo_fala.poll() is None
 
-    return " ".join(texto.split())
+
+# `normalizar` agora vive em jarvis_intencoes (importada acima), junto com o
+# resto do entendimento da fala — uma implementação só, testada uma vez.
 
 
 def extrair_comando_apos_ativacao(frase):
@@ -458,15 +561,6 @@ def capturar_tela():
     return imagem
 
 
-def imagem_para_base64(imagem):
-    memoria_imagem = BytesIO()
-    imagem.save(memoria_imagem, format="PNG")
-
-    return base64.b64encode(
-        memoria_imagem.getvalue()
-    ).decode("utf-8")
-
-
 def descrever_tela_com_ollama():
     if not tela_permitida():
         falar(
@@ -495,6 +589,7 @@ def descrever_tela_com_ollama():
         texto = perguntar_ao_ollama(instrucao)
         falar(texto or "Não consegui identificar conteúdo relevante na tela.")
     except Exception:
+        log.exception("Falha ao descrever a tela")
         falar(
             "Não consegui analisar a tela com a IA local. Verifique se o Ollama está instalado."
         )
@@ -594,6 +689,7 @@ def preparar_clique(texto_procurado):
         )
 
     except Exception:
+        log.exception("Falha ao procurar texto na tela")
         falar("Não consegui procurar esse texto na tela.")
 
 
@@ -614,6 +710,7 @@ def confirmar_clique():
         clique_pendente = None
 
     except Exception:
+        log.exception("Falha ao clicar")
         falar("Não consegui realizar o clique.")
 
 
@@ -625,18 +722,30 @@ def cancelar_clique():
 
 
 def iniciar_ollama_se_necessario():
-    if not CAMINHO_OLLAMA.exists():
-        raise RuntimeError("O executável do Ollama não foi encontrado.")
+    """Tenta subir o `ollama serve` se ele estiver instalado."""
 
+    caminho = CAMINHO_OLLAMA or localizar_ollama()
+
+    if caminho is None:
+        raise RuntimeError("Ollama não encontrado no sistema.")
+
+    log.info("Iniciando o Ollama em %s", caminho)
     subprocess.Popen(
-        [str(CAMINHO_OLLAMA), "serve"],
+        [str(caminho), "serve"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW
+        creationflags=CRIAR_SEM_JANELA,
     )
 
 
 def perguntar_ao_ollama(instrucao):
+    """Consulta o modelo local, com uma segunda tentativa de verdade.
+
+    Antes, se o executável não estivesse no caminho fixo, a exceção de
+    `iniciar_ollama_se_necessario` escapava do `except` e a segunda tentativa
+    nunca acontecia.
+    """
+
     dados = json.dumps({
         "model": MODELO_LOCAL,
         "prompt": instrucao,
@@ -647,6 +756,8 @@ def perguntar_ao_ollama(instrucao):
         }
     }).encode("utf-8")
 
+    ultimo_erro = ""
+
     for tentativa in range(2):
         requisicao = Request(
             OLLAMA_URL,
@@ -656,19 +767,26 @@ def perguntar_ao_ollama(instrucao):
         )
 
         try:
-            with urlopen(requisicao, timeout=120) as resposta:
+            with urlopen(requisicao, timeout=TEMPO_DE_RESPOSTA_DO_OLLAMA) as resposta:
                 resultado = json.loads(resposta.read().decode("utf-8"))
             return resultado.get("response", "").strip()
-        except Exception:
+        except Exception as erro:
+            ultimo_erro = f"{type(erro).__name__}: {erro}"
+            log.warning("Ollama não respondeu (tentativa %s): %s", tentativa + 1, ultimo_erro)
+
             if tentativa == 0:
-                iniciar_ollama_se_necessario()
+                try:
+                    iniciar_ollama_se_necessario()
+                except Exception:
+                    log.exception("Não consegui iniciar o Ollama")
                 time.sleep(2)
 
-    raise RuntimeError("O Ollama não respondeu.")
+    raise RuntimeError(f"O Ollama não respondeu ({ultimo_erro}).")
 
 
 def responder_com_ollama(pergunta):
     print("Jarvis: Pensando...")
+    informar_interface("estado_voz", {"processando": True, "motivo": "pensando"})
 
     if filtro_de_palavroes_ativado():
         regra_de_palavroes = (
@@ -702,32 +820,54 @@ def responder_com_ollama(pergunta):
             falar("Não consegui criar uma resposta agora.")
 
     except Exception:
+        log.exception("Falha ao consultar a IA local")
         falar(
             "Não consegui acessar a IA local. Verifique se o Ollama está instalado."
         )
+    finally:
+        informar_interface("estado_voz", {"processando": False})
 
 
 def listar_aplicativos():
+    """Lista os aplicativos do menu Iniciar (Windows).
+
+    Antes, se o PowerShell não estivesse no PATH, o `subprocess.run` levantava
+    FileNotFoundError e o comando "abrir <app>" morria calado — justamente o
+    comando mais usado.
+    """
+
+    if os.name != "nt":
+        log.info("Listagem de aplicativos do menu Iniciar só existe no Windows")
+        return {}
+
     comando = (
         "Get-StartApps | "
         "Select-Object Name, AppID | "
         "ConvertTo-Json -Compress"
     )
 
-    resultado = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", comando],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace"
-    )
+    try:
+        resultado = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", comando],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=25,
+            creationflags=CRIAR_SEM_JANELA,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as erro:
+        log.error("Não consegui listar os aplicativos: %s", erro)
+        return {}
 
     if not resultado.stdout.strip():
+        log.warning("Listagem de aplicativos voltou vazia (código %s)", resultado.returncode)
         return {}
 
     try:
         dados = json.loads(resultado.stdout)
     except json.JSONDecodeError:
+        log.warning("Listagem de aplicativos em formato inesperado")
         return {}
 
     if isinstance(dados, dict):
@@ -762,11 +902,8 @@ def abrir_aplicativo(nome_falado):
         if nome == nome_app or nome in palavras_nome:
             nome_original, app_id = dados
 
-            subprocess.Popen(
-                ["explorer.exe", f"shell:AppsFolder\\{app_id}"]
-            )
-
-            falar(f"Abrindo {nome_original}.")
+            if abrir_pelo_id(app_id):
+                falar(f"Abrindo {nome_original}.")
             return
 
     parecidos = difflib.get_close_matches(
@@ -779,13 +916,23 @@ def abrir_aplicativo(nome_falado):
     if parecidos:
         nome_original, app_id = aplicativos[parecidos[0]]
 
-        subprocess.Popen(
-            ["explorer.exe", f"shell:AppsFolder\\{app_id}"]
-        )
-
-        falar(f"Abrindo {nome_original}.")
+        if abrir_pelo_id(app_id):
+            falar(f"Abrindo {nome_original}.")
     else:
+        log.info("Aplicativo não encontrado: %r", nome_falado)
         falar(f"Não encontrei o aplicativo {nome_falado}.")
+
+
+def abrir_pelo_id(app_id):
+    """Pede ao Explorer para abrir o aplicativo do menu Iniciar."""
+
+    try:
+        subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+        return True
+    except (FileNotFoundError, OSError) as erro:
+        log.error("Não consegui abrir %s: %s", app_id, erro)
+        falar("Não consegui abrir esse aplicativo.")
+        return False
 
 
 def pesquisar_na_internet(comando):
@@ -837,19 +984,6 @@ def tocar_no_youtube(comando):
     falar(f"Abrindo {musica} no YouTube.")
 
 
-def abrir_automacao_youtube_music():
-    chrome_options = Options()
-    chrome_options.add_argument("--start-maximized")
-    chrome_options.add_argument("--disable-notifications")
-    chrome_options.add_argument("--disable-popup-blocking")
-    chrome_options.add_argument("--user-agent=Mozilla/5.0")
-
-    try:
-        return webdriver.Chrome(options=chrome_options)
-    except Exception:
-        return None
-
-
 def tocar_no_youtube_music(comando):
     musica = comando
 
@@ -874,61 +1008,72 @@ def tocar_no_youtube_music(comando):
     falar(f"Abrindo {musica} no YouTube Music.")
 
 
-def enviar_tecla_de_midia(codigo_tecla):
-    ctypes.windll.user32.keybd_event(codigo_tecla, 0, 0, 0)
-    ctypes.windll.user32.keybd_event(codigo_tecla, 0, 2, 0)
+def enviar_tecla_de_midia(codigo_tecla, repeticoes=1):
+    """Envia uma tecla de mídia do Windows (volume, faixa, play/pausa).
 
+    Duas correções em relação ao original:
 
-def controlar_musica(comando_normalizado):
-    if any(texto in comando_normalizado for texto in [
-        "pausar", "pause", "parar musica", "parar a musica"
-    ]):
-        enviar_tecla_de_midia(0xB3)
-        falar("Pausando a música.")
+    * não explode fora do Windows (o acesso era direto a `ctypes.windll`);
+    * repete o toque, porque um único `VK_VOLUME_UP` muda só ~2% do volume.
+    """
+
+    if os.name != "nt":
+        log.warning("Teclas de mídia não existem neste sistema (0x%X)", codigo_tecla)
+        return False
+
+    try:
+        usuario32 = ctypes.WinDLL("user32", use_last_error=True)
+    except Exception:
+        log.exception("Não consegui acessar a API de teclado do Windows")
+        return False
+
+    try:
+        for _ in range(max(1, int(repeticoes))):
+            usuario32.keybd_event(codigo_tecla, 0, 0, 0)
+            usuario32.keybd_event(codigo_tecla, 0, 2, 0)
+            time.sleep(0.03)
         return True
+    except Exception:
+        log.exception("Falha ao enviar a tecla de mídia 0x%X", codigo_tecla)
+        return False
 
-    if any(texto in comando_normalizado for texto in [
-        "continuar musica", "continuar a musica", "reproduzir musica",
-        "dar play", "play"
-    ]):
-        enviar_tecla_de_midia(0xB3)
-        falar("Reproduzindo a música.")
-        return True
 
-    if any(texto in comando_normalizado for texto in [
-        "proxima musica", "proxima faixa", "pular musica", "pular faixa"
-    ]):
-        enviar_tecla_de_midia(0xB0)
-        falar("Próxima música.")
-        return True
+def controlar_musica(comando_normalizado, passos_de_volume=5):
+    """Teclas de mídia. O volume dá vários toques (um só quase não muda nada)."""
 
-    if any(texto in comando_normalizado for texto in [
-        "musica anterior", "faixa anterior", "voltar musica"
-    ]):
-        enviar_tecla_de_midia(0xB1)
-        falar("Música anterior.")
-        return True
+    acoes = [
+        (("pausar", "pause", "parar musica", "parar a musica"), 0xB3, 1, "Pausando a música."),
+        (("continuar musica", "continuar a musica", "reproduzir musica", "dar play", "play"),
+         0xB3, 1, "Reproduzindo a música."),
+        (("proxima musica", "proxima faixa", "pular musica", "pular faixa"),
+         0xB0, 1, "Próxima música."),
+        (("musica anterior", "faixa anterior", "voltar musica"), 0xB1, 1, "Música anterior."),
+        (("aumentar volume", "aumente o volume"), 0xAF, passos_de_volume, "Aumentando o volume."),
+        (("diminuir volume", "diminua o volume"), 0xAE, passos_de_volume, "Diminuindo o volume."),
+        (("silenciar", "mutar"), 0xAD, 1, "Áudio alternado."),
+    ]
 
-    if "aumentar volume" in comando_normalizado or "aumente o volume" in comando_normalizado:
-        enviar_tecla_de_midia(0xAF)
-        falar("Aumentando o volume.")
-        return True
+    for gatilhos, tecla, repeticoes, resposta in acoes:
+        if not any(texto in comando_normalizado for texto in gatilhos):
+            continue
 
-    if "diminuir volume" in comando_normalizado or "diminua o volume" in comando_normalizado:
-        enviar_tecla_de_midia(0xAE)
-        falar("Diminuindo o volume.")
-        return True
+        if enviar_tecla_de_midia(tecla, repeticoes):
+            falar(resposta)
+        else:
+            falar("Não consegui controlar o áudio neste computador.")
 
-    if "silenciar" in comando_normalizado or "mutar" in comando_normalizado:
-        enviar_tecla_de_midia(0xAD)
-        falar("Áudio alternado.")
         return True
 
     return False
 
 
 def corrigir_texto_copiado(colar_depois=False):
-    texto_original = pyperclip.paste().strip()
+    try:
+        texto_original = (pyperclip.paste() or "").strip()
+    except Exception:
+        log.exception("Não consegui ler a área de transferência")
+        falar("Não consegui ler o texto copiado.")
+        return
 
     if not texto_original:
         falar(
@@ -957,7 +1102,12 @@ def corrigir_texto_copiado(colar_depois=False):
             falar("Não consegui corrigir esse texto.")
             return
 
-        pyperclip.copy(texto_corrigido)
+        try:
+            pyperclip.copy(texto_corrigido)
+        except Exception:
+            log.exception("Não consegui escrever na área de transferência")
+            falar("Não consegui copiar o texto corrigido.")
+            return
 
         if colar_depois:
             falar("Texto corrigido. Vou colar em dois segundos.")
@@ -971,196 +1121,31 @@ def corrigir_texto_copiado(colar_depois=False):
             )
 
     except Exception:
+        log.exception("Falha ao corrigir texto copiado")
         falar("Não consegui corrigir o texto agora.")
 
 
-def selecionar_dispositivo_microfone():
-    try:
-        dispositivos = sd.query_devices()
-    except Exception:
-        return None
+def processar_comando(comando, profundidade=0):
+    """Interpreta e executa um comando.
 
-    if not isinstance(dispositivos, (list, tuple)):
-        return None
+    ``profundidade`` protege contra comandos aprendidos em ciclo (A -> B -> A),
+    que antes causavam RecursionError.
+    """
 
-    for indice, item in enumerate(dispositivos):
-        nome = ""
+    comando = (comando or "").strip()
 
-        if isinstance(item, tuple):
-            if len(item) >= 2:
-                nome = str(item[1])
-        elif isinstance(item, dict):
-            nome = str(item.get("name", ""))
-        else:
-            nome = str(item)
+    if not comando:
+        return True
 
-        texto = nome.lower()
-        if (
-            "microphone" in texto or
-            "microfone" in texto or
-            "mic" in texto or
-            "array" in texto
-        ) and (
-            "mapeador" not in texto and
-            "mapper" not in texto and
-            "output" not in texto and
-            "speaker" not in texto and
-            "alto-falante" not in texto
-        ):
-            return indice
+    if profundidade > 4:
+        log.error("Comandos aprendidos em ciclo; interrompendo (%r)", comando)
+        falar("Os comandos aprendidos estão em ciclo. Remova um deles.")
+        return True
 
-    try:
-        return int(sd.default.device[0])
-    except Exception:
-        return None
-
-
-def ouvir_ate_silencio(tempo_maximo_espera=TEMPO_MAXIMO_DE_ESPERA):
-    fila_de_audio = queue.Queue()
-    dispositivo = selecionar_dispositivo_microfone()
-    inicio_espera = time.monotonic()
-    blocos_anteriores = []
-    blocos_gravados = []
-    iniciou_fala = False
-    inicio_fala = 0.0
-    ultimo_bloco_com_voz = 0.0
-    blocos_com_voz = 0
-    nivel_ruido = float(LIMIAR_MINIMO_DE_VOZ / MULTIPLICADOR_DE_RUIDO)
-
-    def receber_audio(indata, frames, tempo, status):
-        if status:
-            print(f"Jarvis: áudio: {status}")
-        fila_de_audio.put(indata.copy())
-
-    parametros_audio = {
-        "samplerate": TAXA_DE_AUDIO,
-        "channels": 1,
-        "dtype": "int16",
-        "blocksize": 1024,
-        "callback": receber_audio
-    }
-
-    if dispositivo is not None:
-        parametros_audio["device"] = dispositivo
-
-    try:
-        with sd.InputStream(**parametros_audio):
-            while True:
-                agora = time.monotonic()
-                tempo_restante = tempo_maximo_espera - (agora - inicio_espera)
-
-                if tempo_restante <= 0 and not iniciou_fala:
-                    return None
-
-                try:
-                    bloco = fila_de_audio.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-
-                amostras = bloco.astype(np.float32).reshape(-1)
-                nivel = float(np.sqrt(np.mean(amostras * amostras)))
-
-                if not iniciou_fala:
-                    blocos_anteriores.append(bloco)
-                    blocos_anteriores = blocos_anteriores[-8:]
-
-                    if agora - inicio_espera <= 1.0:
-                        nivel_ruido = min(
-                            nivel_ruido * 1.08 + nivel * 0.12,
-                            max(nivel, nivel_ruido)
-                        )
-
-                    limiar = max(
-                        LIMIAR_MINIMO_DE_VOZ,
-                        nivel_ruido * MULTIPLICADOR_DE_RUIDO
-                    )
-
-                    if nivel > limiar:
-                        blocos_com_voz += 1
-                    else:
-                        blocos_com_voz = 0
-
-                    if blocos_com_voz >= 2:
-                        iniciou_fala = True
-                        inicio_fala = agora
-                        ultimo_bloco_com_voz = agora
-                        blocos_gravados.extend(blocos_anteriores)
-                        blocos_anteriores = []
-
-                    continue
-
-                blocos_gravados.append(bloco)
-                limiar = max(
-                    LIMIAR_MINIMO_DE_VOZ,
-                    nivel_ruido * MULTIPLICADOR_DE_RUIDO
-                )
-
-                if nivel > limiar:
-                    ultimo_bloco_com_voz = agora
-
-                terminou_por_silencio = (
-                    agora - ultimo_bloco_com_voz >= SILENCIO_PARA_ENCERRAR and
-                    agora - inicio_fala >= 0.45
-                )
-                terminou_por_tempo = agora - inicio_fala >= TEMPO_MAXIMO_DE_FALA
-
-                if terminou_por_silencio or terminou_por_tempo:
-                    break
-    except Exception as erro_audio:
-        print(f"Jarvis: erro ao capturar o microfone: {erro_audio}")
-        return None
-
-    if not blocos_gravados:
-        return None
-
-    return np.concatenate(blocos_gravados)
-
-
-def transformar_audio_em_texto(audio_gravado):
-    audio = sr.AudioData(
-        audio_gravado.tobytes(),
-        TAXA_DE_AUDIO,
-        2
-    )
-
-    resultado = reconhecedor.recognize_google(
-        audio,
-        language="pt-BR",
-        show_all=True
-    )
-
-    if not resultado or not resultado.get("alternative"):
-        raise sr.UnknownValueError()
-
-    candidatos = [
-        item.get("transcript", "").strip().lower()
-        for item in resultado["alternative"]
-        if item.get("transcript", "").strip()
-    ]
-
-    palavras_prioritarias = (
-        "jarvis", "jarves", "jarviz", "jarvi", "javis",
-        "tocar", "toque", "colocar", "coloque", "abrir",
-        "pesquisar", "pesquise", "procure", "buscar", "corrigir"
-    )
-
-    candidatos.sort(
-        key=lambda texto: sum(
-            palavra in normalizar(texto)
-            for palavra in palavras_prioritarias
-        ),
-        reverse=True
-    )
-    return candidatos[0]
-
-
-def processar_comando(comando):
-    global clique_pendente
-
-    comando = comando.strip()
     comando_normalizado = normalizar(comando)
 
     registrar_memoria("Usuário", comando)
+    log.info("Comando recebido: %r", comando)
 
     if comando_normalizado.startswith("quando eu disser ") or comando_normalizado.startswith("aprenda que "):
         aprender_comando(comando_normalizado)
@@ -1169,11 +1154,13 @@ def processar_comando(comando):
     acao_aprendida = comandos_aprendidos.get(comando_normalizado)
     if acao_aprendida and acao_aprendida != comando_normalizado:
         falar(f"Executando o comando aprendido: {comando_normalizado}.")
-        return processar_comando(acao_aprendida)
+        return processar_comando(acao_aprendida, profundidade + 1)
 
-    if comando_normalizado in ["sair", "fechar jarvis", "encerrar jarvis"]:
-        falar("Até logo!")
-        return False
+    # Uma confirmação já estava esperando resposta?
+    resposta_pendente = tratar_intencao_pendente(comando_normalizado)
+
+    if resposta_pendente is not None:
+        return resposta_pendente
 
     if clique_pendente is not None and comando_normalizado in [
         "sim",
@@ -1186,176 +1173,468 @@ def processar_comando(comando):
 
     if clique_pendente is not None and comando_normalizado in [
         "nao",
-        "não",
         "cancelar",
         "cancelar clique"
     ]:
         cancelar_clique()
         return True
 
-    if (
-        "ler minha tela" in comando_normalizado or
-        "descrever minha tela" in comando_normalizado or
-        "descreva minha tela" in comando_normalizado or
-        "o que tem na minha tela" in comando_normalizado
-    ):
-        descrever_tela_com_ollama()
+    intencao = reconhecer(comando)
+
+    if intencao is None or intencao.nome in ("confirmar", "cancelar"):
+        # Conversa livre (ou um "sim" sem nada pendente): vai para a IA local.
+        informar_interface("estado_voz", {"processando": True, "motivo": "consultando a IA local"})
+        responder_com_ollama(comando)
         return True
 
-    if comando_normalizado.startswith("clicar em "):
-        texto = comando_normalizado.replace("clicar em ", "", 1).strip()
-        preparar_clique(texto)
+    if intencao.precisa_confirmar:
+        return pedir_confirmacao(intencao)
+
+    return executar_intencao(intencao)
+
+
+def pedir_confirmacao(intencao):
+    """Frase parecida com um comando: pergunta antes de agir."""
+
+    global intencao_pendente
+
+    intencao_pendente = intencao
+    descricao = descrever_intencao(intencao)
+
+    log.info(
+        "Pedindo confirmação: %s (confiança %.2f, ouvido %r)",
+        descricao,
+        intencao.confianca,
+        intencao.frase,
+    )
+
+    falar(f"Você quis dizer: {descricao}? Diga sim para eu fazer.")
+    informar_interface(
+        "aviso",
+        {"nivel": "info", "texto": f"Esperando confirmação para {descricao}"},
+    )
+    return True
+
+
+def tratar_intencao_pendente(comando_normalizado):
+    """Responde ao sim/não de uma intenção aguardando confirmação.
+
+    Devolve ``None`` quando não há nada pendente — aí o comando novo segue o
+    fluxo normal, sem ficar preso esperando uma resposta que não vem.
+    """
+
+    global intencao_pendente
+
+    if intencao_pendente is None:
+        return None
+
+    intencao = intencao_pendente
+
+    if comando_normalizado in [
+        "sim", "confirmar", "confirmo", "isso", "pode", "pode sim",
+        "claro", "beleza", "ok", "esta certo", "tudo bem",
+    ]:
+        intencao_pendente = None
+        log.info("Usuário confirmou: %s", intencao.nome)
+        return executar_intencao(intencao)
+
+    if comando_normalizado in [
+        "nao", "cancelar", "deixa", "deixa pra la", "nao quero", "errado",
+    ]:
+        intencao_pendente = None
+        falar("Tudo bem, não vou fazer.")
         return True
 
-    if "que horas" in comando_normalizado or comando_normalizado == "hora":
-        hora = datetime.now().strftime("%H:%M")
-        falar(f"Agora são {hora}.")
+    intencao_pendente = None
+    return None
+
+
+def gerar_imagem(descricao):
+    """Trata o botão "Gerar imagem" do painel.
+
+    O Jarvis não tem gerador de imagens. Antes, o pedido caía no modelo de
+    linguagem e sumia sem resposta. Agora ele é honesto e útil: abre uma
+    busca de imagens com a descrição.
+    """
+
+    descricao = normalizar(descricao)
+
+    for inicio in ("gerar imagem", "criar imagem", "fazer uma imagem", "desenhar", "gerar"):
+        if descricao.startswith(inicio):
+            descricao = descricao[len(inicio):].strip()
+            break
+
+    if not descricao:
+        falar("Diga o que você quer na imagem.")
+        return
+
+    log.info("Pedido de imagem (recurso não disponível): %r", descricao)
+    navegar_no_painel(
+        "https://www.google.com/search?tbm=isch&q=" + quote_plus(descricao)
+    )
+    falar(
+        f"Ainda não sei gerar imagens. Abri uma busca de imagens sobre {descricao}."
+    )
+
+
+def executar_intencao(intencao):
+    """Executa o comando entendido. Devolve False só quando é para encerrar."""
+
+    nome = intencao.nome
+    frase = intencao.frase or ""
+    argumento = intencao.argumento or ""
+
+    log.info("Executando intenção %s (confiança %.2f)", nome, intencao.confianca)
+
+    try:
+        if nome == "sair":
+            falar("Até logo!")
+            return False
+
+        if nome == "hora":
+            falar(f"Agora são {datetime.now().strftime('%H:%M')}.")
+            return True
+
+        if nome == "aprender":
+            aprender_comando(frase)
+            return True
+
+        if nome == "descrever_tela":
+            descrever_tela_com_ollama()
+            return True
+
+        if nome == "corrigir_e_colar":
+            corrigir_texto_copiado(colar_depois=True)
+            return True
+
+        if nome == "corrigir_texto":
+            corrigir_texto_copiado(colar_depois=False)
+            return True
+
+        if nome == "esconder_painel":
+            informar_interface("esconder_painel", {})
+            falar("Escondendo o painel. Para abrir de novo, use o ícone perto do relógio.")
+            return True
+
+        if nome == "holograma":
+            ligar = quer_ligar(intencao)
+            informar_interface("mostrar_holograma", {"visivel": ligar})
+            falar("Holograma ligado." if ligar else "Holograma desligado.")
+            return True
+
+        if nome == "camera":
+            ligar = quer_ligar(intencao)
+            informar_interface("definir_camera", {"ativada": ligar})
+            falar("Câmera ligada." if ligar else "Câmera desligada.")
+            return True
+
+        if nome == "musica_controle":
+            controlar_musica(frase)
+            return True
+
+        if nome == "abrir_youtube_music":
+            navegar_no_painel("https://music.youtube.com")
+            falar("Abrindo o YouTube Music.")
+            return True
+
+        if nome == "abrir_navegador":
+            navegar_no_painel("https://www.google.com")
+            falar("Abrindo o navegador.")
+            return True
+
+        if nome == "tocar_musica":
+            if "youtube music" in frase or "youtube musica" in frase:
+                tocar_no_youtube_music(frase)
+            else:
+                tocar_no_youtube(frase)
+            return True
+
+        if nome == "pesquisar":
+            pesquisar_na_internet(frase)
+            return True
+
+        if nome == "clicar_em":
+            if not argumento:
+                falar("Diga em que devo clicar.")
+                return True
+
+            preparar_clique(argumento)
+            return True
+
+        if nome == "gerar_imagem":
+            gerar_imagem(argumento or frase)
+            return True
+
+        if nome == "abrir_aplicativo":
+            if not argumento:
+                falar("Diga o nome do programa que devo abrir.")
+                return True
+
+            abrir_aplicativo(argumento)
+            return True
+
+    except Exception:
+        log.exception("Falha ao executar a intenção %s (frase %r)", nome, frase)
+        falar("Não consegui fazer isso agora.")
         return True
 
-    if "corrigir e colar" in comando_normalizado or "corrija e cole" in comando_normalizado:
-        corrigir_texto_copiado(colar_depois=True)
-        return True
-
-    if "corrigir texto copiado" in comando_normalizado or "corrija texto copiado" in comando_normalizado:
-        corrigir_texto_copiado(colar_depois=False)
-        return True
-
-    if controlar_musica(comando_normalizado):
-        return True
-
-    if comando_normalizado in ["abrir youtube music", "abrir youtube musica"]:
-        navegar_no_painel("https://music.youtube.com")
-        falar("Abrindo o YouTube Music.")
-        return True
-
-    comandos_musica = ("tocar", "toque", "colocar", "coloque")
-    if (
-        any(comando_normalizado.startswith(item) for item in comandos_musica) and
-        ("youtube music" in comando_normalizado or "you tube music" in comando_normalizado or
-         "musica" in comando_normalizado)
-    ):
-        tocar_no_youtube_music(comando_normalizado)
-        return True
-
-    if (
-        any(comando_normalizado.startswith(item) for item in comandos_musica) and
-        ("youtube" in comando_normalizado or "you tube" in comando_normalizado)
-    ):
-        tocar_no_youtube(comando_normalizado)
-        return True
-
-    if comando_normalizado in ["abrir navegador", "abrir o navegador"]:
-        webbrowser.open("https://www.google.com")
-        falar("Abrindo o navegador.")
-        return True
-
-    if (
-        comando_normalizado.startswith("pesquisar") or
-        comando_normalizado.startswith("pesquise") or
-        comando_normalizado.startswith("procure") or
-        comando_normalizado.startswith("buscar")
-    ):
-        pesquisar_na_internet(comando_normalizado)
-        return True
-
-    if comando_normalizado.startswith("abrir "):
-        nome_aplicativo = comando_normalizado.replace("abrir ", "", 1).strip()
-        abrir_aplicativo(nome_aplicativo)
-        return True
-
-    responder_com_ollama(comando)
+    log.warning("Intenção sem tratamento: %r", nome)
+    responder_com_ollama(frase)
     return True
 
 
 def processar_comandos_interface():
+    """Executa os comandos que o painel enfileirou. False manda encerrar."""
+
     for comando in ler_comandos_interface():
-        processar_comando(comando)
+        log.info("Comando do painel: %r", comando)
+
+        if not processar_comando(comando):
+            return False
+
+    return True
 
 
-tempo_ultima_fala = None
+# ---------------------------------------------------------------------------
+# Voz em segundo plano
+# ---------------------------------------------------------------------------
 
-falar("Jarvis iniciada. Diga Jarvis para falar comigo.")
 
-programa_ativo = True
-modo_conversa_ate = 0
+def criar_detector_de_voz(config):
+    """Traduz a configuração do painel para o detector de voz."""
 
-while programa_ativo:
-    try:
-        processar_comandos_interface()
-        agora = time.monotonic()
+    return DetectorDeVoz(
+        limiar_minimo=float(config.get("limiar_minimo_de_voz", 45)),
+        multiplicador_ruido=float(config.get("multiplicador_de_ruido", 1.8)),
+        silencio_para_encerrar=float(config.get("silencio_para_encerrar", 1.0)),
+    )
 
-        if processo_fala is not None and processo_fala.poll() is None:
-            time.sleep(0.1)
-            continue
 
-        if tempo_ultima_fala is not None and agora < tempo_ultima_fala + TEMPO_COOLDOWN_FALA:
-            time.sleep(0.25)
-            continue
+def atualizar_status_voz(forcar=False):
+    """Manda para o painel o nível, o piso de ruído e o limiar atuais.
 
-        if agora < modo_conversa_ate:
-            audio_comando = ouvir_ate_silencio(
-                tempo_maximo_espera=modo_conversa_ate - agora
+    É o que permite ver *por que* o Jarvis não está ouvindo, em vez de ficar
+    só na frase "Aguardando você dizer: Jarvis".
+    """
+
+    global ultimo_status_voz
+
+    if ouvinte is None:
+        return
+
+    agora = time.monotonic()
+
+    if not forcar and agora - ultimo_status_voz < INTERVALO_DE_STATUS:
+        return
+
+    ultimo_status_voz = agora
+
+    dados = ouvinte.estatisticas()
+    dados["motor"] = gerenciador_voz.ultimo_motor if gerenciador_voz else ""
+    dados["modo_offline"] = bool(gerenciador_voz and gerenciador_voz.em_modo_offline())
+    dados["falando"] = esta_falando()
+    informar_interface("estado_voz", dados)
+
+
+def transcrever_frase(audio):
+    """Transcreve tratando as falhas (com aviso limitado a um por minuto)."""
+
+    if gerenciador_voz is None:
+        return None
+
+    resultado = gerenciador_voz.transcrever(audio)
+
+    if resultado.ok:
+        log.info("Reconhecido (%s): %r", resultado.motor, resultado.texto)
+        return resultado.texto
+
+    log.warning(
+        "Não entendi a fala (%s). Motores tentados: %s",
+        resultado.motivo or "sem detalhe",
+        ", ".join(resultado.motores_tentados) or "nenhum",
+    )
+
+    if gerenciador_voz.deve_avisar_agora():
+        mensagem = gerenciador_voz.mensagem_para_usuario(resultado)
+
+        if mensagem:
+            informar_interface(
+                "aviso",
+                {
+                    "nivel": "erro",
+                    "texto": mensagem,
+                    "detalhe": resultado.motivo,
+                    "motores": resultado.motores_tentados,
+                },
             )
+            falar(mensagem)
 
-            if audio_comando is None:
+    return None
+
+
+def aguardar_frase(tempo_maximo):
+    """Espera a próxima frase pronta, sem travar a interface."""
+
+    limite = time.monotonic() + tempo_maximo
+
+    while programa_ativo and time.monotonic() < limite:
+        if not processar_comandos_interface():
+            return None
+
+        if esta_falando():
+            time.sleep(0.05)
+            continue
+
+        if ouvinte is None or not ouvinte.ativo:
+            return None
+
+        frase = ouvinte.retirar_frase(timeout=0.1)
+
+        if frase is not None:
+            return frase
+
+        atualizar_status_voz()
+
+    return None
+
+
+def preparar_ouvinte(config):
+    """Abre o microfone; se falhar, explica na tela em vez de ficar mudo."""
+
+    global ouvinte
+
+    ouvinte = ThreadOuvinte(
+        config=config,
+        detector=criar_detector_de_voz(config),
+        logger=log,
+    )
+
+    if ouvinte.iniciar():
+        log.info("Microfone em uso: %s", ouvinte.nome_microfone or "padrão do sistema")
+        informar_interface(
+            "aviso",
+            {
+                "nivel": "info",
+                "texto": f"Microfone em uso: {ouvinte.nome_microfone or 'padrão do sistema'}",
+            },
+        )
+        return True
+
+    mensagem = ouvinte.ultimo_erro or "erro desconhecido"
+    log.error("Não consegui abrir o microfone: %s", mensagem)
+    informar_interface(
+        "aviso",
+        {
+            "nivel": "erro",
+            "texto": "Não consegui abrir o microfone.",
+            "detalhe": mensagem,
+        },
+    )
+    falar("Não consegui abrir o microfone. Veja o painel para mais detalhes.")
+    return False
+
+
+def executar():
+    """Laço principal: atende o painel, escuta e executa."""
+
+    global programa_ativo, modo_conversa_ate, gerenciador_voz
+
+    config = carregar_config()
+    gerenciador_voz = GerenciadorDeVoz(config=config, logger=log)
+
+    falar("Jarvis iniciada. Diga Jarvis para falar comigo.")
+
+    if not preparar_ouvinte(config):
+        # Continua rodando: dá para usar o painel e tentar reabrir o microfone.
+        pass
+
+    programa_ativo = True
+    modo_conversa_ate = 0.0
+    ultima_tentativa_de_microfone = time.monotonic()
+
+    while programa_ativo:
+        try:
+            if not processar_comandos_interface():
+                break
+
+            agora = time.monotonic()
+
+            if esta_falando():
+                if ouvinte is not None:
+                    ouvinte.pausar()
+                time.sleep(0.05)
                 continue
 
-            comando = transformar_audio_em_texto(audio_comando)
-            print(f"Você disse: {comando}")
+            if tempo_ultima_fala is not None and agora < tempo_ultima_fala + TEMPO_COOLDOWN_FALA:
+                time.sleep(0.05)
+                continue
 
-            comando_com_jarvis = extrair_comando_apos_ativacao(comando)
+            if ouvinte is not None and ouvinte.pausado:
+                ouvinte.retomar()
 
-            if comando_com_jarvis is not None:
-                comando = comando_com_jarvis
+            if ouvinte is None or not ouvinte.ativo:
+                if agora - ultima_tentativa_de_microfone > 10:
+                    ultima_tentativa_de_microfone = agora
+                    log.info("Tentando reabrir o microfone...")
+                    if preparar_ouvinte(config):
+                        ultima_tentativa_de_microfone = agora
+                atualizar_status_voz()
+                time.sleep(0.2)
+                continue
 
-            if not comando:
+            audio = ouvinte.retirar_frase(timeout=0.1)
+
+            if audio is None:
+                atualizar_status_voz()
+                continue
+
+            texto = transcrever_frase(audio)
+
+            if not texto:
+                atualizar_status_voz()
+                continue
+
+            em_conversa = agora < modo_conversa_ate
+            extraido = extrair_comando_apos_ativacao(texto)
+
+            if extraido is None:
+                if not em_conversa:
+                    log.debug("Frase ignorada (sem a palavra Jarvis): %r", texto)
+                    continue
+                comando = texto
+            else:
+                comando = extraido
+
+            if not comando.strip():
                 falar("Sim?")
-                continue
+
+                audio = aguardar_frase(TEMPO_DE_ESPERA_POR_RESPOSTA)
+
+                if audio is None:
+                    continue
+
+                texto = transcrever_frase(audio)
+
+                if not texto:
+                    continue
+
+                comando = texto
 
             programa_ativo = processar_comando(comando)
             modo_conversa_ate = time.monotonic() + SESSAO_CONVERSA
-            continue
 
-        print("\nAguardando você dizer: Jarvis")
+        except KeyboardInterrupt:
+            log.info("Encerrada por Ctrl+C")
+            break
+        except Exception:
+            log.exception("Erro no laço principal")
+            time.sleep(1)
 
-        audio_ativacao = ouvir_ate_silencio()
+    if ouvinte is not None:
+        ouvinte.parar()
 
-        if audio_ativacao is None:
-            continue
+    log.info("Jarvis encerrada.")
 
-        frase = transformar_audio_em_texto(audio_ativacao)
-        print(f"Você disse: {frase}")
 
-        comando = extrair_comando_apos_ativacao(frase)
-
-        if comando is None:
-            print("Frase ignorada. Aguardando Jarvis...")
-            continue
-
-        if not comando:
-            falar("Sim?")
-
-            audio_comando = ouvir_ate_silencio()
-
-            if audio_comando is None:
-                continue
-
-            comando = transformar_audio_em_texto(audio_comando)
-            print(f"Você disse: {comando}")
-
-        programa_ativo = processar_comando(comando)
-        modo_conversa_ate = time.monotonic() + SESSAO_CONVERSA
-
-    except sr.UnknownValueError:
-        print("Jarvis: Não consegui entender. Tente novamente.")
-
-    except sr.RequestError:
-        falar("Erro ao acessar o reconhecimento de voz.")
-
-    except Exception as erro:
-        print(f"Jarvis: Erro no loop de áudio: {erro}")
-        time.sleep(1)
-
-    except KeyboardInterrupt:
-        print("\nJarvis encerrada.")
-        break
+if __name__ == "__main__":
+    executar()

@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Jarvis: dados de execução (não versionar) ---
+jarvis.log
+memoria_jarvis.jsonl
+# Modelos grandes da câmera: baixados por preparar_modelos.py
+*.task
+memoria_jarvis.jsonl.1
+jarvis.log.*
+dados_navegador/
+fila_comandos/
+fila_eventos/
+*.wav

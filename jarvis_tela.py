@@ -1,36 +1,37 @@
-import json
+import ctypes
 import html
 import math
-import ctypes
 import os
 import sys
 import subprocess
+import time
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
 
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
 
-import psutil
 import cv2
+import psutil
 from mediapipe import Image as MpImage, ImageFormat as MpImageFormat
 from mediapipe.tasks.python import BaseOptions, vision
 
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QMainWindow,
     QLineEdit,
     QMenu,
-    QPlainTextEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QStyle,
@@ -43,72 +44,114 @@ from PySide6.QtWidgets import (
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
+from jarvis_comum import (
+    configurar_log,
+    consumir_eventos,
+    escrever_json_atomico,
+    ler_json,
+    ler_jsonl,
+    publicar_comando,
+    registrar_excecoes_nao_tratadas,
+)
+from jarvis_voz import GerenciadorDeVoz
 
 PASTA = Path(__file__).resolve().parent
-ARQUIVO_MEMORIA = PASTA / "memoria_jarvis.json"
+ARQUIVO_MEMORIA = PASTA / "memoria_jarvis.jsonl"
+ARQUIVO_MEMORIA_LEGADO = PASTA / "memoria_jarvis.json"
 ARQUIVO_CONFIG = PASTA / "config_jarvis.json"
-ARQUIVO_COMANDOS_INTERFACE = PASTA / "comandos_interface.json"
-ARQUIVO_EVENTOS_INTERFACE = PASTA / "eventos_interface.json"
+
+log = configurar_log("jarvis.tela")
+
+# Avisos que o hook de exceções deixa aqui e o painel mostra (com limite de
+# frequência), em vez de sumirem num console que ninguém vê.
+AVISOS_PENDENTES: deque = deque(maxlen=20)
+
+
+def registrar_aviso(mensagem: str) -> None:
+    AVISOS_PENDENTES.append(str(mensagem))
+
+
+registrar_excecoes_nao_tratadas(log, ao_avisar=registrar_aviso)
+
+
+# Teclas usadas pelos gestos (códigos virtuais do Windows).
+CODIGOS_DE_TECLA = {
+    "PGUP": 0x21,
+    "PGDN": 0x22,
+    "SPACE": 0x20,
+    "LEFT": 0x25,
+    "RIGHT": 0x27,
+    "ALT": 0x12,
+}
+
+_CONFIG_EM_CACHE = {"assinatura": None, "dados": None}
 
 
 def carregar_config():
+    """Configuração do painel.
+
+    ``bloquear_ao_sair`` passou a vir **desligado**: com câmera instável,
+    o computador podia bloquear sozinho enquanto a pessoa trabalhava.
+    """
+
     padrao = {
         "visualizacao_de_tela_ativada": False,
         "filtro_palavroes_ativado": False,
         "camera_ativada": True,
-        "bloquear_ao_sair": True,
+        "bloquear_ao_sair": False,
         "detectar_emocoes": True,
         "exoesqueleto_facial": True,
         "holograma_ativado": True,
-        "reagir_a_gestos": True
+        "reagir_a_gestos": True,
+        "microfone": "",
+        "motor_de_voz": "",
+        "modelo_whisper": "small",
+        "pasta_modelo_vosk": "",
+        "limiar_minimo_de_voz": 45,
+        "multiplicador_de_ruido": 1.8,
+        "silencio_para_encerrar": 1.0,
     }
 
     try:
-        if ARQUIVO_CONFIG.exists():
-            dados = json.loads(ARQUIVO_CONFIG.read_text(encoding="utf-8"))
+        estado = ARQUIVO_CONFIG.stat()
+        assinatura = (estado.st_mtime_ns, estado.st_size)
+    except OSError:
+        assinatura = None
 
-            if isinstance(dados, dict):
-                padrao.update(dados)
-    except (json.JSONDecodeError, OSError):
-        pass
+    # O timer da câmera chama isto várias vezes por segundo; sem cache, o
+    # arquivo era lido e reprocessado a cada 220 ms.
+    if _CONFIG_EM_CACHE["assinatura"] == assinatura and _CONFIG_EM_CACHE["dados"] is not None:
+        return dict(_CONFIG_EM_CACHE["dados"])
 
-    return padrao
+    dados = ler_json(ARQUIVO_CONFIG, {})
+    if isinstance(dados, dict):
+        padrao.update(dados)
+
+    _CONFIG_EM_CACHE["assinatura"] = assinatura
+    _CONFIG_EM_CACHE["dados"] = padrao
+
+    return dict(padrao)
 
 
 def salvar_config(config):
-    ARQUIVO_CONFIG.write_text(
-        json.dumps(config, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    if not escrever_json_atomico(ARQUIVO_CONFIG, config):
+        log.error("Falha ao salvar as configurações em %s", ARQUIVO_CONFIG)
 
 
-def carregar_historico():
-    if not ARQUIVO_MEMORIA.exists():
-        return "Jarvis: Ainda não há conversas salvas."
+def preparar_modelos_da_camera():
+    """Garante os modelos do mediapipe sem derrubar a interface se faltarem.
+
+    Antes, um modelo ausente fazia a interface morrer no startup com
+    traceback de mediapipe — sem nenhuma pista do que fazer.
+    """
 
     try:
-        memorias = json.loads(
-            ARQUIVO_MEMORIA.read_text(encoding="utf-8")
-        )
-    except (json.JSONDecodeError, OSError):
-        return "Jarvis: Não foi possível ler a memória."
+        from preparar_modelos import garantir_modelos
 
-    if not isinstance(memorias, list) or not memorias:
-        return "Jarvis: Ainda não há conversas salvas."
-
-    linhas = []
-
-    for item in memorias[-50:]:
-        if not isinstance(item, dict):
-            continue
-        tipo = item.get("tipo", "Jarvis")
-        texto = item.get("texto", "")
-        data = item.get("data", "")
-
-        if texto:
-            linhas.append(f"[{data}] {tipo}: {texto}")
-
-    return "\n\n".join(linhas)
+        return garantir_modelos(PASTA, baixar=True, log=log.info)
+    except Exception:
+        log.exception("Não consegui preparar os modelos da câmera")
+        return ["blaze_face_short_range.tflite", "face_landmarker.task", "hand_landmarker.task"]
 
 
 def criar_cartao(titulo):
@@ -194,43 +237,38 @@ class JanelaJarvis(QMainWindow):
         self.inicio = datetime.now()
         self.ultimo_html_chat = ""
         self.camera = None
-        self.frame_anterior = None
-        self.detector_rosto = vision.FaceDetector.create_from_options(
-            vision.FaceDetectorOptions(
-                base_options=BaseOptions(
-                    model_asset_path=str(PASTA / "blaze_face_short_range.tflite")
-                ),
-                running_mode=vision.RunningMode.IMAGE,
-                min_detection_confidence=0.65
-            )
-        )
-        self.detector_expressoes = vision.FaceLandmarker.create_from_options(
-            vision.FaceLandmarkerOptions(
-                base_options=BaseOptions(
-                    model_asset_path=str(PASTA / "face_landmarker.task")
-                ),
-                running_mode=vision.RunningMode.IMAGE,
-                num_faces=1,
-                output_face_blendshapes=True
-            )
-        )
-        self.detector_maos = vision.HandLandmarker.create_from_options(
-            vision.HandLandmarkerOptions(
-                base_options=BaseOptions(
-                    model_asset_path=str(PASTA / "hand_landmarker.task")
-                ),
-                running_mode=vision.RunningMode.IMAGE,
-                num_hands=2,
-                min_hand_detection_confidence=0.65,
-                min_hand_presence_confidence=0.65,
-                min_tracking_confidence=0.6
-            )
-        )
+
+        # Modelos da câmera: garantidos aqui, com aviso claro se faltarem.
+        self.modelos_faltando = preparar_modelos_da_camera()
+        self.detector_rosto = None
+        self.detector_expressoes = None
+        self.detector_maos = None
+        self.criar_detectores()
+
+        # Modelos pesados rodam em cadências diferentes (ver _atualizar_camera):
+        # o de expressões é o mais caro e não precisa de 4,5 análises por
+        # segundo. O último resultado fica guardado para desenhar nos quadros
+        # intermediários, então nada pisca.
+        self.contador_de_frames = 0
+        self.cadencia_de_expressoes = 3
+        self._ultima_expressao = None
+
+        # Estado de proteção dos recursos (evita fechar detector duas vezes).
+        self.recursos_liberados = False
+        self.encerrando = False
+        self.ultimo_frame_ok = 0.0
+        self.erro_na_camera_ate = 0.0
+
+        # Bloqueio por ausência: agenda antes de bloquear (dá tempo de voltar).
+        self.bloqueio_agendado_para = 0.0
+        self.aviso_de_bloqueio_dado = False
+
         self.ultimo_bloqueio = 0
         self.ultimo_rosto = None
         self.rosto_confirmado = False
         self.emocao_atual = "indisponível"
         self.camera_expandida = False
+        self.ultimo_estado_voz = {}
         self.janela_camera_cheia = None
         self.camera_preview_cheia = None
         self.janela_navegador_expandida = None
@@ -420,6 +458,66 @@ class JanelaJarvis(QMainWindow):
         self.timer_camera.start(220)
 
         self.atualizar_painel()
+
+    def criar_detectores(self):
+        """Cria os detectores do mediapipe, um a um, sem derrubar a interface.
+
+        Cada modelo sustenta um recurso diferente: sem o de mãos não há gestos
+        nem holograma; sem o de expressões não há emoções. O que faltar é
+        informado na tela.
+        """
+
+        if self.modelos_faltando:
+            log.warning(
+                "Modelos ausentes (%s): recursos de câmera reduzidos",
+                ", ".join(self.modelos_faltando),
+            )
+
+        if "blaze_face_short_range.tflite" not in self.modelos_faltando:
+            try:
+                self.detector_rosto = vision.FaceDetector.create_from_options(
+                    vision.FaceDetectorOptions(
+                        base_options=BaseOptions(
+                            model_asset_path=str(PASTA / "blaze_face_short_range.tflite")
+                        ),
+                        running_mode=vision.RunningMode.IMAGE,
+                        min_detection_confidence=0.65,
+                    )
+                )
+            except Exception:
+                log.exception("Falha ao criar o detector de rosto")
+
+        if "face_landmarker.task" not in self.modelos_faltando:
+            try:
+                self.detector_expressoes = vision.FaceLandmarker.create_from_options(
+                    vision.FaceLandmarkerOptions(
+                        base_options=BaseOptions(
+                            model_asset_path=str(PASTA / "face_landmarker.task")
+                        ),
+                        running_mode=vision.RunningMode.IMAGE,
+                        num_faces=1,
+                        output_face_blendshapes=True,
+                    )
+                )
+            except Exception:
+                log.exception("Falha ao criar o detector de expressões")
+
+        if "hand_landmarker.task" not in self.modelos_faltando:
+            try:
+                self.detector_maos = vision.HandLandmarker.create_from_options(
+                    vision.HandLandmarkerOptions(
+                        base_options=BaseOptions(
+                            model_asset_path=str(PASTA / "hand_landmarker.task")
+                        ),
+                        running_mode=vision.RunningMode.IMAGE,
+                        num_hands=2,
+                        min_hand_detection_confidence=0.65,
+                        min_hand_presence_confidence=0.65,
+                        min_tracking_confidence=0.6,
+                    )
+                )
+            except Exception:
+                log.exception("Falha ao criar o detector de mãos")
 
     def montar_interface(self):
         central = QWidget()
@@ -632,7 +730,6 @@ class JanelaJarvis(QMainWindow):
         self.abas_navegador.tabCloseRequested.connect(self.fechar_aba_navegador)
         self.abas_navegador.currentChanged.connect(self.trocar_aba_navegador)
         self.abas_navegador.addTab(self.navegador, "YouTube Music")
-        self.layout_navegador = layout_navegador
         layout_navegador.addLayout(barra_navegador)
         layout_navegador.addWidget(self.abas_navegador)
         layout_navegador.addLayout(botoes_navegador)
@@ -856,9 +953,6 @@ class JanelaJarvis(QMainWindow):
         self.layout_conversa.insertWidget(0, self.historico)
         self.atualizar_historico()
 
-    def processar_pagina_navegador(self, carregou):
-        self.processar_pagina_aba(self.navegador, carregou)
-
     def abrir_primeiro_resultado_musica(self, view=None):
         view = view or self.navegador
         if "music.youtube.com/search" not in view.url().toString():
@@ -911,7 +1005,8 @@ class JanelaJarvis(QMainWindow):
 
     def atualizar_painel(self):
         agora = datetime.now()
-        self.processar_eventos_holograma()
+        self.processar_eventos_da_interface()
+        self.mostrar_avisos_pendentes()
 
         self.relogio.setText(
             agora.strftime("%H:%M:%S  |  %d/%m/%Y")
@@ -950,8 +1045,59 @@ class JanelaJarvis(QMainWindow):
 
         self.atualizar_historico()
 
+    def mostrar_avisos_pendentes(self):
+        """Mostra erros capturados pelo hook global, com limite de frequência."""
+
+        while AVISOS_PENDENTES:
+            mensagem = AVISOS_PENDENTES.popleft()
+            agora = datetime.now().timestamp()
+
+            if agora < getattr(self, "_proximo_aviso_de_erro", 0):
+                log.warning("Aviso suprimido na tela: %s", mensagem)
+                continue
+
+            if not hasattr(self, "tray"):
+                AVISOS_PENDENTES.appendleft(mensagem)
+                break
+
+            self._proximo_aviso_de_erro = agora + 15
+            self.mostrar_aviso("Ocorreu um erro interno. Veja jarvis.log", mensagem, "erro")
+
     def atualizar_camera(self):
+        """Ponto de entrada do timer da câmera: nunca pode derrubar o app.
+
+        Antes, uma exceção aqui (por exemplo `detect()` num detector já
+        fechado) subia pela thread do Qt a cada 220 ms, para sempre — e sem
+        `sys.excepthook` isso podia até encerrar o processo.
+        """
+
+        if self.recursos_liberados or self.encerrando:
+            return
+
+        try:
+            self._atualizar_camera()
+        except Exception:
+            agora = datetime.now().timestamp()
+
+            if agora >= self.erro_na_camera_ate:
+                self.erro_na_camera_ate = agora + 30
+                log.exception("Falha ao atualizar a câmera")
+
+            try:
+                self.camera_status.setText("● Câmera com erro — veja jarvis.log")
+            except Exception:
+                pass
+
+    def _atualizar_camera(self):
         config = carregar_config()
+
+        if self.detector_rosto is None and config.get("camera_ativada", True):
+            # Modelos ausentes: explica na tela em vez de estourar exceção.
+            self.camera_preview.setText("Modelos da câmera não instalados")
+            self.camera_status.setText(
+                "● Execute 'python preparar_modelos.py' para habilitar a câmera"
+            )
+            return
 
         if not config.get("camera_ativada", True):
             if self.camera is not None:
@@ -979,8 +1125,9 @@ class JanelaJarvis(QMainWindow):
             self.camera_status.setText("● Não foi possível ler a câmera")
             return
 
+        self.ultimo_frame_ok = datetime.now().timestamp()
+        self.contador_de_frames += 1
         frame = cv2.flip(frame, 1)
-        movimento = self.detectar_movimento(frame)
         imagem_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resultado_rosto = self.detector_rosto.detect(
             MpImage(
@@ -993,29 +1140,43 @@ class JanelaJarvis(QMainWindow):
         gesto = "nenhum"
         agora = datetime.now().timestamp()
 
+        if not tem_rosto:
+            self._ultima_expressao = None
+
         if tem_rosto:
             self.ultimo_rosto = datetime.now().timestamp()
             self.rosto_confirmado = True
             self.desenhar_rosto(frame, resultado_rosto.detections)
 
-            if config.get("detectar_emocoes", True) or config.get("exoesqueleto_facial", True):
-                resultado_expressao = self.detector_expressoes.detect(
-                    MpImage(
-                        image_format=MpImageFormat.SRGB,
-                        data=imagem_rgb
-                    )
-                )
-                if config.get("exoesqueleto_facial", True):
-                    for landmarks in resultado_expressao.face_landmarks:
-                        self.desenhar_exoesqueleto_facial(frame, landmarks)
+            if self.detector_expressoes is not None and (
+                config.get("detectar_emocoes", True) or config.get("exoesqueleto_facial", True)
+            ):
+                if self.contador_de_frames % self.cadencia_de_expressoes == 0:
+                    try:
+                        self._ultima_expressao = self.detector_expressoes.detect(
+                            MpImage(
+                                image_format=MpImageFormat.SRGB,
+                                data=imagem_rgb
+                            )
+                        )
+                    except Exception:
+                        log.exception("Falha ao analisar as expressões faciais")
+                        self._ultima_expressao = None
 
-                if config.get("detectar_emocoes", True):
-                    emocao = self.estimar_emocao(resultado_expressao)
-                    self.emocao_atual = emocao
+                resultado_expressao = self._ultima_expressao
 
-            
+                if resultado_expressao is not None:
+                    if config.get("exoesqueleto_facial", True):
+                        for landmarks in resultado_expressao.face_landmarks:
+                            self.desenhar_exoesqueleto_facial(frame, landmarks)
 
-        if config.get("reagir_a_gestos", True):
+                    if config.get("detectar_emocoes", True):
+                        emocao = self.estimar_emocao(resultado_expressao)
+                        self.emocao_atual = emocao
+
+
+
+        if config.get("reagir_a_gestos", True) and self.detector_maos is not None:
             resultado_maos = self.detector_maos.detect(
                 MpImage(
                     image_format=MpImageFormat.SRGB,
@@ -1054,6 +1215,8 @@ class JanelaJarvis(QMainWindow):
                 self.centro_mao_anterior = None
                 self.distancia_mao_anterior = None
 
+        maos = locals().get("maos", []) or []
+
         if self.holograma_visivel and config.get("holograma_ativado", True):
             self.desenhar_holograma_67(frame)
 
@@ -1062,18 +1225,7 @@ class JanelaJarvis(QMainWindow):
             else agora - self.ultimo_rosto
         )
 
-        if (
-            self.rosto_confirmado and
-            tempo_sem_rosto is not None and
-            tempo_sem_rosto >= 8 and
-            config.get("bloquear_ao_sair", True)
-        ):
-            if agora - self.ultimo_bloqueio > 30:
-                self.ultimo_bloqueio = agora
-                subprocess.Popen(
-                    ["rundll32.exe", "user32.dll,LockWorkStation"],
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
+        self.atualizar_bloqueio_por_ausencia(config, agora, tempo_sem_rosto)
 
         imagem = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         altura, largura, canais = imagem.shape
@@ -1116,36 +1268,166 @@ class JanelaJarvis(QMainWindow):
             f"mãos: {quantidade_maos} | gesto: {reacao or 'nenhum'} | sem gravação"
         )
 
-    def processar_eventos_holograma(self):
-        if not ARQUIVO_EVENTOS_INTERFACE.exists():
+    def atualizar_bloqueio_por_ausencia(self, config, agora, tempo_sem_rosto):
+        """Bloqueia o PC quando você sai — com trava de segurança.
+
+        Regras novas (o antigo bloqueava direto, e podia travar o computador
+        enquanto você trabalhava, se a câmera falhasse ou você ficasse de lado):
+
+        * a câmera precisa estar saudável (frame lido nos últimos 3 s);
+        * a sessão precisa ter pelo menos 1 minuto;
+        * o bloqueio é **avisado** 10 segundos antes, e cancelado se o rosto
+          aparecer nesse intervalo.
+        """
+
+        if not config.get("bloquear_ao_sair", False):
             return
 
-        try:
-            eventos = json.loads(
-                ARQUIVO_EVENTOS_INTERFACE.read_text(encoding="utf-8")
+        if os.name != "nt":
+            return
+
+        if not self.rosto_confirmado or tempo_sem_rosto is None:
+            return
+
+        # Câmera saudável?
+        if agora - self.ultimo_frame_ok > 3:
+            return
+
+        if (datetime.now() - self.inicio).total_seconds() < 60:
+            return
+
+        if tempo_sem_rosto < 8:
+            self.bloqueio_agendado_para = 0.0
+            self.aviso_de_bloqueio_dado = False
+            return
+
+        if self.bloqueio_agendado_para == 0.0:
+            self.bloqueio_agendado_para = agora + 10
+
+            if not self.aviso_de_bloqueio_dado:
+                self.aviso_de_bloqueio_dado = True
+                log.info("Sem rosto há %.1fs: bloqueio agendado em 10s", tempo_sem_rosto)
+                self.camera_status.setText(
+                    "● Sem rosto: vou bloquear o computador em 10 segundos (mexa-se para cancelar)"
+                )
+                if hasattr(self, "tray"):
+                    self.tray.showMessage(
+                        "Jarvis",
+                        "Não estou vendo você. Vou bloquear o computador em 10 segundos.",
+                        QSystemTrayIcon.MessageIcon.Information,
+                        6000,
+                    )
+
+        if agora >= self.bloqueio_agendado_para:
+            self.bloqueio_agendado_para = 0.0
+            self.aviso_de_bloqueio_dado = False
+            self.ultimo_bloqueio = agora
+            log.warning("Bloqueando o computador por ausência")
+            subprocess.Popen(
+                ["rundll32.exe", "user32.dll,LockWorkStation"],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except (json.JSONDecodeError, OSError):
-            return
 
-        if not isinstance(eventos, list):
-            return
+    def processar_eventos_da_interface(self):
+        """Atende os recados vindos do processo de voz.
 
-        try:
-            ARQUIVO_EVENTOS_INTERFACE.write_text("[]", encoding="utf-8")
-        except OSError:
-            pass
+        Antes isso se chamava `processar_eventos_holograma` e o único evento
+        tratado (`mostrar_holograma`) nunca era emitido por ninguém — ou seja,
+        o holograma era impossível de ligar. Agora o painel também mostra
+        avisos de erro e o estado do microfone/reconhecimento.
+        """
 
-        for evento in eventos:
+        for evento in consumir_eventos():
             if not isinstance(evento, dict):
                 continue
 
-            if evento.get("tipo") == "mostrar_holograma":
-                self.holograma_visivel = True
+            tipo = evento.get("tipo")
+            dados = evento.get("dados") or {}
 
-            if evento.get("tipo") == "navegar_navegador":
-                url = evento.get("dados", {}).get("url", "")
+            if tipo == "mostrar_holograma":
+                self.holograma_visivel = bool(dados.get("visivel", True))
+                self.camera_status.setText(
+                    "● Holograma "
+                    + ("ligado" if self.holograma_visivel else "desligado")
+                )
+                log.info("Holograma %s", "ligado" if self.holograma_visivel else "desligado")
+
+            elif tipo == "esconder_painel":
+                log.info("Pedido de voz: esconder o painel")
+                self.esconder_painel()
+
+            elif tipo == "definir_camera":
+                ativada = bool(dados.get("ativada", True))
+                config = carregar_config()
+                config["camera_ativada"] = ativada
+                salvar_config(config)
+                log.info("Câmera %s por pedido de voz", "ligada" if ativada else "desligada")
+                self.camera_status.setText(
+                    "● Câmera " + ("ligada" if ativada else "desligada")
+                )
+
+            elif tipo == "navegar_navegador":
+                url = dados.get("url", "")
                 if url:
                     self.navegador.setUrl(QUrl(url))
+                    log.info("Painel navegando para %s", url)
+
+            elif tipo == "estado_voz":
+                self.atualizar_estado_da_voz(dados)
+
+            elif tipo == "aviso":
+                self.mostrar_aviso(
+                    str(dados.get("texto", "")),
+                    str(dados.get("detalhe", "")),
+                    str(dados.get("nivel", "info")),
+                )
+
+    def atualizar_estado_da_voz(self, dados):
+        """Mostra na tela o que o reconhecimento está fazendo."""
+
+        self.ultimo_estado_voz = dict(dados)
+
+        if dados.get("processando"):
+            self.estado_voz.setText("● Pensando...")
+            return
+
+        if not dados:
+            return
+
+        motor = dados.get("motor") or "—"
+        offline = " | modo offline" if dados.get("modo_offline") else ""
+
+        if dados.get("erro"):
+            self.estado_voz.setText(f"● Microfone com erro{motor and ' | motor ' + motor}")
+            return
+
+        motivo = dados.get("motivo", "")
+        relacao = dados.get("relacao")
+        detalhe = f" | sinal {relacao}x do limiar" if isinstance(relacao, (int, float)) else ""
+
+        self.estado_voz.setText(
+            f"● Ouvindo (motor: {motor}{offline}){detalhe}"
+            + (f" — {motivo}" if motivo and motivo != "aguardando voz" else "")
+        )
+
+    def mostrar_aviso(self, texto, detalhe="", nivel="info"):
+        if not texto:
+            return
+
+        log.warning("Aviso na tela (%s): %s %s", nivel, texto, detalhe)
+
+        if hasattr(self, "estado_voz"):
+            self.estado_voz.setText(f"● {texto}")
+
+        if hasattr(self, "tray"):
+            self.tray.showMessage(
+                "Jarvis",
+                texto + (f"\n{detalhe}" if detalhe else ""),
+                QSystemTrayIcon.MessageIcon.Warning
+                if nivel == "erro"
+                else QSystemTrayIcon.MessageIcon.Information,
+                6000,
+            )
 
     def atualizar_controle_holograma_duas_maos(self, maos):
         pincas = []
@@ -1220,53 +1502,12 @@ class JanelaJarvis(QMainWindow):
 
     def camera_cheia_fechada(self):
         self.camera_expandida = False
+        self.ultimo_estado_voz = {}
         self.botao_expandir_camera.setText("Expandir câmera")
 
     def fechar_camera_cheia(self):
         if self.janela_camera_cheia is not None:
             self.janela_camera_cheia.close()
-
-    def palma_virada_para_cima(self, mao):
-        dedos_estendidos = sum(
-            mao[ponta].y < mao[articulacao].y
-            for ponta, articulacao in [(8, 6), (12, 10), (16, 14), (20, 18)]
-        )
-        palma_aberta = dedos_estendidos >= 3
-        palma_inclinada = mao[12].y < mao[0].y + 0.12
-        return palma_aberta and palma_inclinada
-
-    def atualizar_controle_holograma(self, mao, dimensoes_frame):
-        distancia_pinca = max(
-            ((mao[4].x - mao[8].x) ** 2 + (mao[4].y - mao[8].y) ** 2) ** 0.5,
-            0.001
-        )
-        pinca_ativa = distancia_pinca < 0.16
-
-        if not pinca_ativa:
-            self.mao_segura_holograma = False
-            self.centro_mao_anterior = None
-            self.distancia_mao_anterior = None
-            return
-
-        centro_x = mao[8].x
-        centro_y = mao[8].y
-
-        if self.centro_mao_anterior is not None:
-            delta_x = centro_x - self.centro_mao_anterior[0]
-            delta_y = centro_y - self.centro_mao_anterior[1]
-            self.holograma_rotacao_y = (self.holograma_rotacao_y + delta_x * 720) % 360
-            self.holograma_rotacao_x = (self.holograma_rotacao_x + delta_y * 360) % 360
-
-        if self.distancia_mao_anterior is not None:
-            variacao = distancia_pinca / self.distancia_mao_anterior
-            self.holograma_escala = max(
-                0.55,
-                min(2.2, self.holograma_escala * variacao)
-            )
-
-        self.mao_segura_holograma = True
-        self.centro_mao_anterior = (centro_x, centro_y)
-        self.distancia_mao_anterior = distancia_pinca
 
     def desenhar_holograma_67(self, frame):
         altura, largura = frame.shape[:2]
@@ -1339,19 +1580,6 @@ class JanelaJarvis(QMainWindow):
             int(centro_x + x * 115 * escala * perspectiva),
             int(centro_y + y * 115 * escala * perspectiva)
         )
-
-    def detectar_movimento(self, frame):
-        cinza = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        cinza = cv2.GaussianBlur(cinza, (21, 21), 0)
-
-        if self.frame_anterior is None:
-            self.frame_anterior = cinza
-            return False
-
-        diferenca = cv2.absdiff(self.frame_anterior, cinza)
-        self.frame_anterior = cinza
-        _, mascara = cv2.threshold(diferenca, 25, 255, cv2.THRESH_BINARY)
-        return cv2.countNonZero(mascara) > frame.shape[0] * frame.shape[1] * 0.025
 
     def desenhar_rosto(self, frame, deteccoes):
         altura, largura = frame.shape[:2]
@@ -1454,7 +1682,10 @@ class JanelaJarvis(QMainWindow):
             cv2.putText(frame, f"Gesto: {comando}", (18, 34), cv2.FONT_HERSHEY_DUPLEX, 0.7, (120, 240, 255), 1, cv2.LINE_AA)
 
     def scroll_page(self, quantidade):
-        self.enviar_tecla_windows("{PGUP}" if quantidade > 0 else "{PGDN}")
+        self.enviar_tecla_windows(
+            "{PGUP}" if quantidade > 0 else "{PGDN}",
+            repeticoes=min(4, max(1, abs(int(quantidade)) // 2)),
+        )
 
     def navegar_historico(self, direcao):
         self.enviar_tecla_windows("%{LEFT}" if direcao == "voltar" else "%{RIGHT}")
@@ -1462,9 +1693,51 @@ class JanelaJarvis(QMainWindow):
     def alternar_reproducao(self):
         self.enviar_tecla_windows("{SPACE}")
 
-    def enviar_tecla_windows(self, tecla):
-        comando = f"$wshell = New-Object -ComObject WScript.Shell; $wshell.SendKeys('{tecla}')"
-        subprocess.Popen(["powershell.exe", "-NoProfile", "-Command", comando], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+    def enviar_tecla_windows(self, tecla, repeticoes=1):
+        """Envia a tecla direto pelo Windows, sem abrir um PowerShell por gesto.
+
+        Antes, cada gesto de mão abria um processo `powershell.exe` para usar
+        `WScript.Shell.SendKeys` — centenas de milissegundos de atraso, um
+        processo novo a cada gesto, e o atalho ia para **qualquer** janela em
+        foco. Agora é a mesma técnica das teclas de mídia do main.py
+        (`keybd_event`), sem criar processo nenhum.
+        """
+
+        if os.name != "nt":
+            log.warning("Teclas de gesto não existem neste sistema (%s)", tecla)
+            return False
+
+        alt = tecla.startswith("%")
+        nome = tecla.replace("%", "").strip("{}").upper()
+        codigo = CODIGOS_DE_TECLA.get(nome)
+
+        if codigo is None:
+            log.warning("Tecla de gesto desconhecida: %r", tecla)
+            return False
+
+        try:
+            usuario32 = ctypes.WinDLL("user32", use_last_error=True)
+        except Exception:
+            log.exception("Não consegui acessar a API de teclado do Windows")
+            return False
+
+        try:
+            for _ in range(max(1, int(repeticoes))):
+                if alt:
+                    usuario32.keybd_event(CODIGOS_DE_TECLA["ALT"], 0, 0, 0)
+
+                usuario32.keybd_event(codigo, 0, 0, 0)
+                usuario32.keybd_event(codigo, 0, 2, 0)
+
+                if alt:
+                    usuario32.keybd_event(CODIGOS_DE_TECLA["ALT"], 0, 2, 0)
+
+                time.sleep(0.02)
+
+            return True
+        except Exception:
+            log.exception("Falha ao enviar a tecla de gesto %r", tecla)
+            return False
 
     def desenhar_mao(self, frame, mao):
         altura, largura = frame.shape[:2]
@@ -1557,19 +1830,33 @@ class JanelaJarvis(QMainWindow):
         return "neutro"
 
     def ler_memoria(self):
-        if not ARQUIVO_MEMORIA.exists():
-            return []
+        """Lê a memória reaproveitando o último resultado quando o arquivo não mudou.
+
+        O painel atualiza uma vez por segundo; sem cache, isso relia e
+        reprocessava o arquivo inteiro (que só cresce) duas vezes por segundo.
+        """
+
+        caminho = ARQUIVO_MEMORIA if ARQUIVO_MEMORIA.exists() else ARQUIVO_MEMORIA_LEGADO
 
         try:
-            dados = json.loads(
-                ARQUIVO_MEMORIA.read_text(encoding="utf-8")
-            )
-
-            if not isinstance(dados, list):
-                return []
-            return [item for item in dados if isinstance(item, dict)]
-        except (json.JSONDecodeError, OSError):
+            estado = caminho.stat()
+            assinatura = (estado.st_mtime_ns, estado.st_size, caminho.name)
+        except OSError:
+            self._memoria_cache = []
+            self._memoria_assinatura = None
             return []
+
+        if getattr(self, "_memoria_assinatura", None) == assinatura:
+            return self._memoria_cache
+
+        dados = ler_jsonl(ARQUIVO_MEMORIA) if ARQUIVO_MEMORIA.exists() else ler_json(ARQUIVO_MEMORIA_LEGADO, [])
+        self._memoria_cache = (
+            [item for item in dados if isinstance(item, dict)]
+            if isinstance(dados, list)
+            else []
+        )
+        self._memoria_assinatura = assinatura
+        return self._memoria_cache
 
     def atualizar_historico(self):
         barra = self.historico.verticalScrollBar()
@@ -1619,30 +1906,26 @@ class JanelaJarvis(QMainWindow):
         texto, confirmou = QInputDialog.getText(
             self,
             "Gerar imagem",
-            "Descreva a imagem:"
+            "Descreva a imagem ou o tema da busca:"
         )
 
         if confirmou and texto.strip():
             self.enfileirar_comando(f"gerar imagem {texto.strip()}")
 
     def enfileirar_comando(self, texto):
-        comandos = []
+        """Entrega o comando para o processo de voz.
 
-        if ARQUIVO_COMANDOS_INTERFACE.exists():
-            try:
-                dados = json.loads(
-                    ARQUIVO_COMANDOS_INTERFACE.read_text(encoding="utf-8")
-                )
-                if isinstance(dados, list):
-                    comandos = dados
-            except (json.JSONDecodeError, OSError):
-                comandos = []
+        Cada comando é um arquivo próprio (jarvis_comum), então não existe
+        mais o risco de o Jarvis ler o arquivo no mesmo instante em que o
+        painel grava — o que fazia o comando simplesmente sumir.
+        """
 
-        comandos.append({"texto": texto, "data": datetime.now().isoformat()})
-        ARQUIVO_COMANDOS_INTERFACE.write_text(
-            json.dumps(comandos, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
+        if not publicar_comando(texto):
+            log.error("Não consegui entregar o comando ao processo de voz: %r", texto)
+            return False
+
+        log.info("Comando enviado pelo painel: %r", texto)
+        return True
 
     def abrir_configuracoes(self):
         janela = QDialog(self)
@@ -1686,11 +1969,78 @@ class JanelaJarvis(QMainWindow):
         layout = QVBoxLayout(janela)
 
         texto = QLabel(
-            "As opções são salvas no seu computador e valem para a próxima resposta da Jarvis."
+            "As opções são salvas no seu computador e aplicadas na hora "
+            "(câmera, gestos e holograma) ou na próxima resposta da Jarvis (voz)."
         )
         texto.setWordWrap(True)
 
         config = carregar_config()
+
+        # -- microfone -------------------------------------------------------
+        rotulo_aviso_microfone = QLabel("")
+        rotulo_aviso_microfone.setWordWrap(True)
+        rotulo_aviso_microfone.setObjectName("textoPequeno")
+        rotulo_microfone = QLabel("Microfone:")
+        combo_microfone = QComboBox()
+        combo_microfone.addItem("Automático (recomendado)", "")
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        try:
+            from jarvis_audio import listar_microfones
+
+            microfones = listar_microfones()
+            rotulo_aviso_microfone.setText(
+                f"{len(microfones)} microfone(s) encontrados."
+            )
+
+            for microfone in microfones:
+                marca = " (padrão do sistema)" if microfone["padrao"] else ""
+                combo_microfone.addItem(
+                    f"{microfone['nome']}{marca}", str(microfone["indice"])
+                )
+        except Exception as erro:
+            log.exception("Não consegui listar os microfones")
+            rotulo_aviso_microfone.setText(
+                f"Não consegui listar os microfones ({type(erro).__name__}: {erro}). "
+                "O Jarvis vai usar o padrão do sistema."
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        escolhido = str(config.get("microfone", "") or "")
+        indice_escolhido = combo_microfone.findData(escolhido)
+        combo_microfone.setCurrentIndex(max(0, indice_escolhido))
+
+        # -- motor de voz ----------------------------------------------------
+        rotulo_motor = QLabel("Reconhecimento de voz:")
+        combo_motor = QComboBox()
+        combo_motor.addItem("Automático (com plano B)", "")
+
+        nomes_amigaveis = {
+            "google": "Google (pela internet, mais preciso)",
+            "whisper": "Whisper local (offline)",
+            "vosk": "Vosk local (offline)",
+            "windows": "Reconhecimento do Windows (offline)",
+        }
+
+        try:
+            for motor in GerenciadorDeVoz(config=config, logger=log).disponiveis():
+                combo_motor.addItem(nomes_amigaveis.get(motor, motor), motor)
+        except Exception:
+            log.exception("Não consegui descobrir os motores de voz")
+
+        motor_escolhido = str(config.get("motor_de_voz", "") or "")
+        indice_motor = combo_motor.findData(motor_escolhido)
+        combo_motor.setCurrentIndex(max(0, indice_motor))
+
+        dica_motor = QLabel(
+            "Automático usa o melhor motor disponível e, se a internet cair, "
+            "passa para um offline sozinho. Para instalar o Whisper local: "
+            "pip install faster-whisper"
+        )
+        dica_motor.setObjectName("textoPequeno")
+        dica_motor.setWordWrap(True)
 
         checkbox_tela = QCheckBox(
             "Permitir visualização de tela quando eu pedir"
@@ -1709,7 +2059,9 @@ class JanelaJarvis(QMainWindow):
         checkbox_camera = QCheckBox("Manter câmera ativa e analisar movimentos")
         checkbox_camera.setChecked(config.get("camera_ativada", True))
 
-        checkbox_presenca = QCheckBox("Bloquear computador quando eu sair da câmera")
+        checkbox_presenca = QCheckBox(
+            "Bloquear computador quando eu sair da câmera (avisa 10s antes)"
+        )
         checkbox_presenca.setChecked(config.get("bloquear_ao_sair", True))
 
         checkbox_emocoes = QCheckBox("Estimar expressões faciais pela câmera")
@@ -1735,13 +2087,26 @@ class JanelaJarvis(QMainWindow):
             config["exoesqueleto_facial"] = checkbox_exoesqueleto.isChecked()
             config["holograma_ativado"] = checkbox_holograma.isChecked()
             config["reagir_a_gestos"] = checkbox_gestos.isChecked()
+            config["microfone"] = combo_microfone.currentData() or ""
+            config["motor_de_voz"] = combo_motor.currentData() or ""
 
             salvar_config(config)
+            log.info(
+                "Configurações salvas (microfone=%r, motor de voz=%r)",
+                config["microfone"],
+                config["motor_de_voz"],
+            )
             janela.accept()
 
         salvar.clicked.connect(confirmar)
 
         layout.addWidget(texto)
+        layout.addWidget(rotulo_aviso_microfone)
+        layout.addWidget(rotulo_microfone)
+        layout.addWidget(combo_microfone)
+        layout.addWidget(rotulo_motor)
+        layout.addWidget(combo_motor)
+        layout.addWidget(dica_motor)
         layout.addWidget(checkbox_tela)
         layout.addWidget(checkbox_filtro)
         layout.addWidget(checkbox_camera)
@@ -1771,7 +2136,7 @@ class JanelaJarvis(QMainWindow):
         esconder.triggered.connect(self.esconder_painel)
 
         sair = QAction("Fechar Jarvis", self)
-        sair.triggered.connect(QApplication.quit)
+        sair.triggered.connect(self.encerrar)
 
         menu.addAction(mostrar)
         menu.addAction(esconder)
@@ -1802,25 +2167,85 @@ class JanelaJarvis(QMainWindow):
         self.activateWindow()
 
     def closeEvent(self, evento):
+        """O X esconde o painel — e a câmera continua funcionando.
+
+        Aqui estava o bug mais cruel do projeto: o X fechava os detectores do
+        mediapipe e **continuava** chamando `detect()` neles a cada 220 ms,
+        gerando `ValueError: Task runner is currently not running.` em loop.
+        Para encerrar de verdade, use "Fechar Jarvis" na bandeja.
+        """
+
+        if self.encerrando:
+            evento.accept()
+            return
+
         evento.ignore()
-        self.liberar_camera()
+        log.info("Painel escondido (use a bandeja para reabrir ou encerrar)")
         self.esconder_painel()
 
+    def encerrar(self):
+        """Encerramento de verdade, chamado pela bandeja."""
+
+        log.info("Encerrando a interface")
+        self.encerrando = True
+        self.liberar_camera()
+        QApplication.quit()
+
     def liberar_camera(self):
+        """Libera câmera e detectores — uma única vez e sem estourar erro."""
+
+        if self.recursos_liberados:
+            return
+
+        self.recursos_liberados = True
+
+        try:
+            self.timer_camera.stop()
+        except Exception:
+            pass
+
         if self.camera is not None:
-            self.camera.release()
+            try:
+                self.camera.release()
+            except Exception:
+                log.exception("Falha ao liberar a câmera")
             self.camera = None
 
-        self.detector_rosto.close()
-        self.detector_expressoes.close()
-        self.detector_maos.close()
+        for nome in ("detector_rosto", "detector_expressoes", "detector_maos"):
+            detector = getattr(self, nome, None)
 
+            if detector is None:
+                continue
+
+            try:
+                detector.close()
+            except Exception:
+                log.exception("Falha ao fechar %s", nome)
+
+            setattr(self, nome, None)
+
+        log.info("Recursos da câmera liberados")
 
 
 app = QApplication(sys.argv)
 app.setQuitOnLastWindowClosed(False)
 
 janela = JanelaJarvis()
+
+if janela.modelos_faltando:
+    QTimer.singleShot(
+        1200,
+        lambda: QMessageBox.warning(
+            janela,
+            "Modelos da câmera",
+            "Faltam arquivos de modelo para a câmera:\n\n"
+            + "\n".join(f"• {nome}" for nome in janela.modelos_faltando)
+            + "\n\nSem eles, os recursos de câmera ficam desativados "
+            "(o resto da Jarvis funciona).\n\n"
+            "Rode na pasta do projeto:  python preparar_modelos.py",
+        ),
+    )
+
 janela.showMaximized()
 app.aboutToQuit.connect(janela.liberar_camera)
 
