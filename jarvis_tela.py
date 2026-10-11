@@ -245,6 +245,14 @@ class JanelaJarvis(QMainWindow):
         self.detector_maos = None
         self.criar_detectores()
 
+        # Modelos pesados rodam em cadências diferentes (ver _atualizar_camera):
+        # o de expressões é o mais caro e não precisa de 4,5 análises por
+        # segundo. O último resultado fica guardado para desenhar nos quadros
+        # intermediários, então nada pisca.
+        self.contador_de_frames = 0
+        self.cadencia_de_expressoes = 3
+        self._ultima_expressao = None
+
         # Estado de proteção dos recursos (evita fechar detector duas vezes).
         self.recursos_liberados = False
         self.encerrando = False
@@ -1118,6 +1126,7 @@ class JanelaJarvis(QMainWindow):
             return
 
         self.ultimo_frame_ok = datetime.now().timestamp()
+        self.contador_de_frames += 1
         frame = cv2.flip(frame, 1)
         imagem_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resultado_rosto = self.detector_rosto.detect(
@@ -1131,6 +1140,9 @@ class JanelaJarvis(QMainWindow):
         gesto = "nenhum"
         agora = datetime.now().timestamp()
 
+        if not tem_rosto:
+            self._ultima_expressao = None
+
         if tem_rosto:
             self.ultimo_rosto = datetime.now().timestamp()
             self.rosto_confirmado = True
@@ -1139,21 +1151,30 @@ class JanelaJarvis(QMainWindow):
             if self.detector_expressoes is not None and (
                 config.get("detectar_emocoes", True) or config.get("exoesqueleto_facial", True)
             ):
-                resultado_expressao = self.detector_expressoes.detect(
-                    MpImage(
-                        image_format=MpImageFormat.SRGB,
-                        data=imagem_rgb
-                    )
-                )
-                if config.get("exoesqueleto_facial", True):
-                    for landmarks in resultado_expressao.face_landmarks:
-                        self.desenhar_exoesqueleto_facial(frame, landmarks)
+                if self.contador_de_frames % self.cadencia_de_expressoes == 0:
+                    try:
+                        self._ultima_expressao = self.detector_expressoes.detect(
+                            MpImage(
+                                image_format=MpImageFormat.SRGB,
+                                data=imagem_rgb
+                            )
+                        )
+                    except Exception:
+                        log.exception("Falha ao analisar as expressões faciais")
+                        self._ultima_expressao = None
 
-                if config.get("detectar_emocoes", True):
-                    emocao = self.estimar_emocao(resultado_expressao)
-                    self.emocao_atual = emocao
+                resultado_expressao = self._ultima_expressao
 
-            
+                if resultado_expressao is not None:
+                    if config.get("exoesqueleto_facial", True):
+                        for landmarks in resultado_expressao.face_landmarks:
+                            self.desenhar_exoesqueleto_facial(frame, landmarks)
+
+                    if config.get("detectar_emocoes", True):
+                        emocao = self.estimar_emocao(resultado_expressao)
+                        self.emocao_atual = emocao
+
+
 
         if config.get("reagir_a_gestos", True) and self.detector_maos is not None:
             resultado_maos = self.detector_maos.detect(

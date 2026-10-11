@@ -1,4 +1,5 @@
-﻿import base64
+﻿import atexit
+import base64
 import ctypes
 import difflib
 import json
@@ -36,6 +37,7 @@ from jarvis_intencoes import (
     quer_ligar,
     reconhecer,
 )
+from jarvis_tts import MotorDeFala
 from jarvis_voz import GerenciadorDeVoz
 
 log = configurar_log("jarvis")
@@ -119,6 +121,7 @@ CAMINHO_OLLAMA = localizar_ollama()
 clique_pendente = None
 intencao_pendente = None
 processo_fala = None
+motor_de_fala = None
 tempo_ultima_fala = None
 programa_ativo = True
 modo_conversa_ate = 0.0
@@ -376,11 +379,41 @@ def selecionar_voz_windows():
 
 
 def falar(texto):
-    global processo_fala, tempo_ultima_fala
+    """Fala uma frase.
+
+    O caminho normal é o motor persistente (jarvis_tts): um único processo de
+    fala para toda a sessão. Se ele não estiver disponível (fora do Windows,
+    PowerShell bloqueado, voz ausente), cai no processo único por frase — o
+    comportamento antigo — para nunca ficar muda.
+    """
+
+    global motor_de_fala, processo_fala, tempo_ultima_fala
 
     print(f"Jarvis: {texto}")
     registrar_memoria("Jarvis", texto)
     tempo_ultima_fala = time.monotonic()
+
+    if os.name != "nt":
+        # Fora do Windows não existe System.Speech: o texto sai no console.
+        log.info("(voz indisponível neste sistema) %s", texto)
+        return
+
+    if motor_de_fala is None:
+        motor_de_fala = MotorDeFala(logger=log, voz=selecionar_voz_windows())
+        atexit.register(motor_de_fala.fechar)
+
+    if motor_de_fala.falar(texto):
+        return
+
+    log.warning(
+        "Motor de fala persistente indisponível (%s); usando o modo antigo",
+        motor_de_fala.ultimo_erro,
+    )
+    processo_fala = _falar_em_processo_unico(texto)
+
+
+def _falar_em_processo_unico(texto):
+    """Reserva: um PowerShell por frase (antes era o único caminho)."""
 
     voz = selecionar_voz_windows()
 
@@ -395,18 +428,26 @@ def falar(texto):
         comando_powershell.encode("utf-16le")
     ).decode("ascii")
 
-    if os.name != "nt":
-        # Fora do Windows não existe System.Speech: o texto sai no console.
-        log.info("(voz indisponível neste sistema) %s", texto)
-        return
+    try:
+        return subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-EncodedCommand", comando_codificado],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=CRIAR_SEM_JANELA,
+        )
+    except (FileNotFoundError, OSError) as erro:
+        log.error("Nem o modo antigo de fala funcionou: %s", erro)
+        return None
 
-    processo_fala = subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-EncodedCommand", comando_codificado],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        creationflags=CRIAR_SEM_JANELA,
-    )
+
+def esta_falando():
+    """A Jarvis está falando agora? (motor persistente ou processo único)"""
+
+    if motor_de_fala is not None and motor_de_fala.falando():
+        return True
+
+    return processo_fala is not None and processo_fala.poll() is None
 
 
 # `normalizar` agora vive em jarvis_intencoes (importada acima), junto com o
@@ -1391,7 +1432,7 @@ def atualizar_status_voz(forcar=False):
     dados = ouvinte.estatisticas()
     dados["motor"] = gerenciador_voz.ultimo_motor if gerenciador_voz else ""
     dados["modo_offline"] = bool(gerenciador_voz and gerenciador_voz.em_modo_offline())
-    dados["falando"] = processo_fala is not None and processo_fala.poll() is None
+    dados["falando"] = esta_falando()
     informar_interface("estado_voz", dados)
 
 
@@ -1440,7 +1481,7 @@ def aguardar_frase(tempo_maximo):
         if not processar_comandos_interface():
             return None
 
-        if processo_fala is not None and processo_fala.poll() is None:
+        if esta_falando():
             time.sleep(0.05)
             continue
 
@@ -1518,7 +1559,7 @@ def executar():
 
             agora = time.monotonic()
 
-            if processo_fala is not None and processo_fala.poll() is None:
+            if esta_falando():
                 if ouvinte is not None:
                     ouvinte.pausar()
                 time.sleep(0.05)
