@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Jarvis: dados de execução (não versionar) ---
+jarvis.log
+jarvis.log.*
+dados_navegador/
+fila_comandos/
+fila_eventos/
+*.wav
