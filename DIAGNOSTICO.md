@@ -212,3 +212,83 @@ python -c "import PySide6, mediapipe; print(PySide6.__version__, mediapipe.__ver
 ```
 
 Itens 2, 3 e 4 são os que mais provavelmente explicam travamentos silenciosos na sua máquina.
+
+---
+
+# Status da implementação (11/10/2026)
+
+Tudo o que está marcado como ✅ foi implementado e tem teste automatizado.
+Os testes rodam **sem Windows** (73 testes, `python -m unittest discover -s testes -t .`):
+
+```
+Ran 73 tests — OK
+```
+
+## Fase 1 — Observabilidade e não-travar
+
+| Bug | Situação | Como |
+|---|---|---|
+| B1 (sem log) | ✅ | `jarvis_comum.configurar_log()` grava `jarvis.log` (rotativo, 2 MB × 3) nos dois processos; **todos** os `except` genéricos passaram a registrar `log.exception` antes de falar |
+| B4 (fechar janela mata a câmera) | ✅ | o **X só esconde** (não existe mais `close()` de detetor em uso); `detect()` roda dentro de `try` no timer; `liberar_camera()` é chamado uma única vez, com flag. Teste de bancada: `detect()` após `close()` → `ValueError: Task runner is currently not running.` — reproduzido e explicado |
+| B7 (bloqueio do PC ligado por padrão) | ✅ | padrão agora é `false`; mesmo ligado: exige câmera saudável, 1 min de sessão e **avisa 10 s antes** |
+| B12 (sem excepthook) | ✅ | `registrar_excecoes_nao_tratadas()` nos dois processos — log + aviso na tela (com limite de frequência) |
+| B13 (processo órfão) | ✅ | `iniciar_jarvis.py` reescrito: confere dependências/modelos antes, vigia os dois processos e encerra o irmão em qualquer saída; funciona fora do Windows |
+
+## Fase 2 — "Não me escuta / não responde"
+
+| Bug | Situação | Como |
+|---|---|---|
+| B2 (voz sem plano B) | ✅ | `jarvis_voz.py`: cadeia **Google → Whisper local → Vosk → SAPI do Windows**; após 3 falhas seguidas entra em modo offline por 5 min; erro é **avisado uma vez** (no painel e falado), não em laço |
+| B3 (comando do painel espera 60 s) | ✅ | captura de áudio em **thread própria** (`jarvis_audio.ThreadOuvinte`); o laço principal nunca mais fica surdo ao painel; espera máxima por resposta caiu para 8 s |
+| B8 (limiar que nunca se adapta) | ✅ | piso de ruído adaptativo com mediana/piso/teto + **vigia de ruído constante**: se o sinal fica acima do limiar sem parar e sem modular (ventilador, motor), o piso é recalibrado — sem isso o app ficava "surdo" para sempre. Tem teste com ventilador sintético a 120 Hz |
+| B9 (microfone errado) | ✅ | `escolher_microfone()` filtra por canal de entrada, prefere o padrão do sistema e aceita a escolha do painel (novo campo nas Configurações) |
+
+## Fase 4 — Entender o que você fala
+
+| Bug | Situação | Como |
+|---|---|---|
+| B11 ("use um comando específico") | ✅ | `jarvis_intencoes.py` (23 testes): sinônimos de verbo (abra/abre/inicia/executa/roda → abrir), palavras de enchimento, parecença com **faixa de confirmação** ("Você quis dizer...?") e as frases do seu histórico que falhavam: *"ta vendo minha tela"*, *"o que estou vendo"*, *"para ligar a câmera"*, *"tira holograma para mim"*, *"esconder painel"* |
+| B19 (retry do Ollama morto + caminho fixo) | ✅ | `localizar_ollama()` (OLLAMA_EXECUTABLE → PATH → pastas usuais); retry de verdade com o erro real registrado; tempo limite de 60 s; painel mostra "Pensando..." |
+
+## Fase 3 — Dados à prova de corrida
+
+| Bug | Situação | Como |
+|---|---|---|
+| B5 (corrida nos JSON) | ✅ | `jarvis_comum.FilaDeArquivos`: cada comando/evento é **um arquivo próprio** (nada de ler-gravar-apagar o mesmo arquivo); escrita atômica em todos os JSON |
+| B6 (memória reescrita inteira) | ✅ | histórico passou a `memoria_jarvis.jsonl` (uma linha por mensagem, anexo com rotação em 8 MB); o `.json` antigo é migrado na primeira execução e fica de cópia; painel lê com cache por `mtime` |
+
+## Fase 5 — Recursos que você já pediu
+
+| Item | Situação | Como |
+|---|---|---|
+| Holograma (nunca ligava) | ✅ | agora existe comando de voz de verdade: *"liga o holograma"*, *"tira o holograma para mim"*, *"quero um holograma"* → evento `mostrar_holograma` |
+| Botão "Gerar imagem" (não fazia nada) | ✅ | o pedido é reconhecido e **respondido com honestidade**: "ainda não sei gerar imagens" + abre uma busca de imagens (em vez de cair no LLM e sumir) |
+| B10 (TTS lento / não interrompível) | ✅ | `jarvis_tts.py`: **um** processo de fala para toda a sessão, com marcas de "falando/livre" e comando `!parar` (fim do PowerShell por frase). Se falhar, cai no modo antigo |
+| B15 (câmera na thread da GUI) | 🟡 | **mitigado**: o modelo de expressões (o mais caro) roda a cada 3 quadros e o resultado é reaproveitado nos intermediários; o de mãos continua a cada quadro para o gesto responder. Thread separada fica como próximo passo |
+
+## Fase 6 — Limpeza e portabilidade
+
+| Bug | Situação | Como |
+|---|---|---|
+| B14 (modelos ausentes) | ✅ | `preparar_modelos.py`: copia o modelo de rosto **de dentro do pacote mediapipe** (sem internet) e baixa os dois `.task`; a interface avisa na tela o que falta e continua funcionando sem eles |
+| B16 (chaves de config mortas) | ✅ | `visao_ativada` e `bloquear_com_punho` (que nada liam) saíram do `config_jarvis.json`; o diálogo de Configurações ganhou microfone e motor de voz |
+| B17 (SendKeys na janela em foco) | ✅ | gestos usam `keybd_event` direto (sem abrir PowerShell por gesto) e o volume dá 5 passos por comando (antes 2% por comando) |
+| B18 (recursão de comando aprendido) | ✅ | profundidade máxima + mensagem "os comandos aprendidos estão em ciclo" |
+| B20 (código e dependências mortos) | ✅ | saíram: `selenium`, `pyttsx3`, `teste_voz.py`, `imagem_para_base64`, `abrir_automacao_youtube_music`, `carregar_historico`, `palma_virada_para_cima`, `atualizar_controle_holograma`, `processar_pagina_navegador`, `detectar_movimento` (rodava OpenCV a cada quadro para nada) e imports sem uso |
+
+## Testes novos (rodam no Linux **e** no seu Windows)
+
+| Arquivo | O que cobre |
+|---|---|
+| `testes/teste_audio.py` | detecção de voz: limiar adaptativo, vigia de ruído constante, microfone com entrada/saída |
+| `testes/teste_voz.py` | cadeia de motores, modo offline, aviso de erro uma vez por minuto |
+| `testes/teste_intencoes.py` | sinônimos, enchimento, confirmação e **ausência de falso positivo** na conversa livre |
+| `testes/teste_comandos.py` | importa o `main.py` de verdade (com dublês de Windows) e roda 23 comandos do seu histórico: nenhum pode estourar |
+| `testes/teste_fala.py` | protocolo do TTS persistente (base64, `!parar`, `!sair`, marcas de estado) |
+| `testes/teste_tela.py` | fumaça da interface: monta a janela inteira com o navegador dublê (pula se não houver PySide6) |
+
+## O que continua pendente
+
+* **B15 completo** — thread separada para a câmera (hoje só a mitigação de cadência).
+* **Reconhecimento offline mais preciso** — instalar `faster-whisper` (`pip install faster-whisper`) ou o modelo pt-BR do Vosk; o app já usa automaticamente se existir.
+* **Teste em Windows** — pelo checklist abaixo; os modelos `.task` precisam ser baixados uma vez (`python preparar_modelos.py`).
