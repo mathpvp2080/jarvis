@@ -287,6 +287,16 @@ Ran 73 tests — OK
 | `testes/teste_fala.py` | protocolo do TTS persistente (base64, `!parar`, `!sair`, marcas de estado) |
 | `testes/teste_tela.py` | fumaça da interface: monta a janela inteira com o navegador dublê (pula se não houver PySide6) |
 
+### Ajuste de 12/10/2026 — primeiro aviso de falha de voz era engolido
+
+`jarvis_voz.py`: `GerenciadorDeVoz.ultimo_aviso` nascia com `0.0` e era
+comparado com `time.monotonic()`. Nos primeiros `INTERVALO_MINIMO_ENTRE_AVISOS`
+(60 s) de vida da máquina a diferença fica menor que o intervalo, então o
+**primeiro** aviso de erro de voz não aparecia — justamente o caso de quem liga
+o PC e abre o Jarvis na sequência. Agora o campo nasce `None` e a comparação só
+acontece quando não é `None`
+(`testes/teste_voz.py::test_nao_repete_aviso_em_loop` cobre o caso).
+
 ## O que continua pendente
 
 * **B15 completo** — thread separada para a câmera (hoje só a mitigação de cadência).
