@@ -247,7 +247,10 @@ class GerenciadorDeVoz:
 
         self.falhas_seguidas = 0
         self.modo_offline_ate = 0.0
-        self.ultimo_aviso = 0.0
+        # None (e não 0.0) porque perto do boot time.monotonic() ainda é menor
+        # que INTERVALO_MINIMO_ENTRE_AVISOS: com 0.0 o primeiro aviso de erro
+        # era engolido e o usuário ficava sem saber que a voz falhou.
+        self.ultimo_aviso: float | None = None
         self.ultimo_motor = ""
 
     # -- disponibilidade ---------------------------------------------------
@@ -366,8 +369,9 @@ class GerenciadorDeVoz:
 
         agora = time.monotonic()
 
-        if agora - self.ultimo_aviso < INTERVALO_MINIMO_ENTRE_AVISOS:
-            return False
+        if self.ultimo_aviso is not None:
+            if agora - self.ultimo_aviso < INTERVALO_MINIMO_ENTRE_AVISOS:
+                return False
 
         self.ultimo_aviso = agora
         return True
