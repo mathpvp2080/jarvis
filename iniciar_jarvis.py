@@ -118,11 +118,32 @@ def encerrar(processo: subprocess.Popen | None, nome: str) -> None:
 
 
 def ultimas_linhas_do_log(quantidade: int = 15) -> str:
+    """Últimas linhas dos logs, com os dois processos misturados por horário.
+
+    Cada processo tem o seu arquivo (``jarvis.log`` e ``jarvis.tela.log``), então
+    mostrar só um esconderia justamente o lado que falhou.
+    """
+
     try:
-        linhas = ARQUIVO_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
-        return "\n".join(linhas[-quantidade:])
-    except OSError:
-        return ""
+        from jarvis_comum import arquivos_de_log
+
+        caminhos = arquivos_de_log()
+    except Exception:
+        caminhos = [ARQUIVO_LOG]
+
+    linhas = []
+
+    for caminho in caminhos:
+        try:
+            texto = caminho.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+
+        linhas += [f"[{caminho.name}] {linha}" for linha in texto[-quantidade:]]
+
+    linhas.sort()
+
+    return "\n".join(linhas[-quantidade:])
 
 
 def main() -> int:

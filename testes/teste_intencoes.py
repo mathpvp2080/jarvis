@@ -11,6 +11,7 @@ import unittest
 from jarvis_intencoes import (
     LIMIAR_DE_EXECUCAO,
     descrever,
+    extrair_argumento,
     normalizar,
     quer_ligar,
     reconhecer,
@@ -202,6 +203,105 @@ class TesteNormalizacao(unittest.TestCase):
         self.assertIsNone(reconhecer(""))
         self.assertIsNone(reconhecer("   "))
         self.assertIsNone(reconhecer(None))
+
+
+class TesteExtracaoDoArgumento(unittest.TestCase):
+    """O argumento é o que vira busca/nome de programa: não pode levar lixo.
+
+    Estes casos são reais. Antes o argumento saía da frase sem enchimento e era
+    limpo em `main.py` com `str.replace`, o que produzia:
+
+    * "gerar imagem de um dragão" → busca por **"imagem dragao"**;
+    * "tocar Toque de Midas no youtube" → busca por **"de midas"** (o "toque"
+      do verbo era removido de dentro do título);
+    * "abre o chrome para mim" → **"chrome pausar"** (a canonicalização troca
+      "mim" pelo verbo "pausar").
+    """
+
+    def test_vocabulario_do_comando_nao_vira_busca(self):
+        for frase, esperado in (
+            ("gerar imagem de um dragão", "dragao"),
+            ("criar imagem de um gato", "gato"),
+            ("gerar uma foto do mar", "mar"),
+            ("desenhar um dragão", "dragao"),
+        ):
+            with self.subTest(frase=frase):
+                intencao = reconhecer(frase)
+
+                self.assertEqual(intencao.nome, "gerar_imagem")
+                self.assertEqual(intencao.argumento, esperado)
+
+    def test_titulo_que_contem_o_verbo_sobrevive(self):
+        intencao = reconhecer("tocar toque de midas no youtube")
+
+        self.assertEqual(intencao.nome, "tocar_musica")
+        self.assertEqual(intencao.argumento, "toque de midas")
+
+    def test_cauda_da_plataforma_sai_inteira(self):
+        for frase, esperado in (
+            ("toca back in black no youtube music", "back in black"),
+            ("toca acdc no youtube", "acdc"),
+            ("coloca jazz no spotify", "jazz"),
+        ):
+            with self.subTest(frase=frase):
+                self.assertEqual(reconhecer(frase).argumento, esperado)
+
+    def test_para_mim_nao_vira_pausar(self):
+        for frase in ("abre o chrome para mim", "abre o chrome pra mim agora"):
+            with self.subTest(frase=frase):
+                intencao = reconhecer(frase)
+
+                self.assertEqual(intencao.argumento, "chrome")
+
+    def test_preposicao_do_pedido_nao_vaza_para_a_busca(self):
+        self.assertEqual(reconhecer("pesquise sobre buracos negros").argumento, "buracos negros")
+        self.assertEqual(reconhecer("pesquisar guns n roses no youtube").argumento, "guns n roses")
+
+    def test_miolo_do_nome_nao_e_aparado(self):
+        """Artigo/preposição **no meio** do nome fazem parte dele.
+
+        É a diferença entre buscar "toque midas" e "toque de midas".
+        """
+
+        for palavras, intencao, esperado in (
+            (["toque", "de", "midas"], "tocar_musica", "toque de midas"),
+            (["bloco", "de", "notas"], "abrir_aplicativo", "bloco de notas"),
+            (["por", "do", "sol"], "gerar_imagem", "por do sol"),
+        ):
+            with self.subTest(palavras=palavras):
+                self.assertEqual(extrair_argumento(palavras, intencao), esperado)
+
+    def test_bordas_sao_aparadas(self):
+        self.assertEqual(extrair_argumento(["o", "chrome"], "abrir_aplicativo"), "chrome")
+        self.assertEqual(extrair_argumento(["youtube", "music"], "tocar_musica"), "")
+
+    def test_verbo_no_fim_do_pedido(self):
+        self.assertEqual(reconhecer("coloca jazz pra tocar").argumento, "jazz")
+
+    def test_pedido_sem_conteudo_pede_confirmacao(self):
+        for frase in ("gerar imagem", "abrir aplicativo", "pesquisar na internet", "gerar"):
+            with self.subTest(frase=frase):
+                intencao = reconhecer(frase)
+
+                self.assertIsNotNone(intencao, frase)
+                self.assertEqual(intencao.argumento, "", f"{frase!r} não tem argumento")
+                self.assertTrue(
+                    intencao.precisa_confirmar,
+                    f"{frase!r} deveria perguntar o quê, em vez de executar",
+                )
+
+    def test_nomes_de_programa_continuam_inteiros(self):
+        for frase, esperado in (
+            ("abrir bloco de notas", "bloco de notas"),
+            ("abre o google chrome", "google chrome"),
+            ("chama o visual studio code", "visual studio code"),
+        ):
+            with self.subTest(frase=frase):
+                self.assertEqual(reconhecer(frase).argumento, esperado)
+
+    def test_extrair_argumento_sem_intencao_nao_faz_magia(self):
+        self.assertEqual(extrair_argumento(["back", "in", "black"]), "back in black")
+        self.assertEqual(extrair_argumento([]), "")
 
 
 if __name__ == "__main__":

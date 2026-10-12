@@ -2,7 +2,8 @@
 
 Concentra três coisas que antes existiam duplicadas e frágeis em cada arquivo:
 
-1. Log em arquivo (``jarvis.log``) + captura de exceções não tratadas.
+1. Log em arquivo, um por processo (``jarvis.log`` e ``jarvis.tela.log``),
+   + captura de exceções não tratadas.
 2. Leitura/escrita de JSON à prova de corrupção (escrita atômica).
 3. Uma fila de mensagens baseada em arquivos, sem *read-modify-write* — o que
    elimina a perda de comandos/eventos entre os dois processos.
@@ -26,11 +27,44 @@ from pathlib import Path
 PASTA = Path(__file__).resolve().parent
 ARQUIVO_LOG = PASTA / "jarvis.log"
 
+
+def arquivo_de_log(nome: str = "jarvis") -> Path:
+    """Arquivo de log de um processo.
+
+    Cada processo grava no **seu** arquivo: ``jarvis.log`` (voz) e
+    ``jarvis.tela.log`` (interface). Antes os dois dividiam o mesmo arquivo com
+    um ``RotatingFileHandler`` cada — e rotação de log com dois escritores no
+    Windows falha no rename (o outro processo está com o arquivo aberto), o que
+    podia perder o histórico bem na hora de investigar um erro.
+    """
+
+    nome_limpo = "".join(
+        caractere if caractere.isalnum() or caractere in "._-" else "_"
+        for caractere in str(nome or "jarvis")
+    ).strip(".")
+
+    return PASTA / (f"{nome_limpo}.log" if nome_limpo != "jarvis" else "jarvis.log")
+
+
+def arquivos_de_log() -> list:
+    """Todos os logs do projeto, do mais recente para o mais antigo."""
+
+    try:
+        encontrados = sorted(
+            PASTA.glob("jarvis*.log*"),
+            key=lambda caminho: caminho.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return [ARQUIVO_LOG]
+
+    return encontrados or [ARQUIVO_LOG]
+
 # Pasta onde cada processo deposita mensagens para o outro.
 PASTA_FILA_COMANDOS = PASTA / "fila_comandos"
 PASTA_FILA_EVENTOS = PASTA / "fila_eventos"
 
-_LOG_CONFIGURADO = False
+_LOGS_CONFIGURADOS: set = set()
 _LOCK_JSON = threading.RLock()
 
 
@@ -42,26 +76,37 @@ _LOCK_JSON = threading.RLock()
 def configurar_log(nome: str = "jarvis", nivel: int = logging.INFO) -> logging.Logger:
     """Configura (uma única vez por processo) log em arquivo rotativo + console.
 
-    O arquivo fica na pasta do projeto e é limitado a 2 MB x 3 arquivos, para
-    não crescer sem controle.
-    """
+    O arquivo fica na pasta do projeto, é próprio do processo (veja
+    :func:`arquivo_de_log`) e é limitado a 2 MB x 3 arquivos, para não crescer
+    sem controle.
 
-    global _LOG_CONFIGURADO
+    ``propagate`` é desligado para que os loggers filhos (``jarvis.tts``,
+    ``jarvis.voz``) não dupliquem as linhas na raiz quando algo instalar um
+    handler lá.
+
+    O controle é **por nome**: num mesmo processo podem existir loggers
+    diferentes (o da voz e o da interface, quando um importa o outro), e cada um
+    precisa do seu arquivo.
+    """
 
     logger = logging.getLogger(nome)
 
-    if _LOG_CONFIGURADO:
+    if nome in _LOGS_CONFIGURADOS:
         return logger
 
     logger.setLevel(nivel)
+    logger.propagate = False
+
     formato = logging.Formatter(
         "%(asctime)s %(levelname)-7s [%(name)s] %(threadName)s: %(message)s",
         datefmt="%d/%m/%Y %H:%M:%S",
     )
 
+    caminho = arquivo_de_log(nome)
+
     try:
         manipulador = logging.handlers.RotatingFileHandler(
-            ARQUIVO_LOG,
+            caminho,
             maxBytes=2 * 1024 * 1024,
             backupCount=3,
             encoding="utf-8",
@@ -70,14 +115,14 @@ def configurar_log(nome: str = "jarvis", nivel: int = logging.INFO) -> logging.L
         logger.addHandler(manipulador)
     except OSError:
         # Se não der para escrever o log, o console ainda serve.
-        pass
+        caminho = None
 
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formato)
     logger.addHandler(console)
 
-    _LOG_CONFIGURADO = True
-    logger.info("Log iniciado em %s", ARQUIVO_LOG)
+    _LOGS_CONFIGURADOS.add(nome)
+    logger.info("Log iniciado em %s", caminho or "somente console")
     return logger
 
 
@@ -187,7 +232,7 @@ def ler_jsonl(caminho: Path, limite: int | None = None) -> list:
     registros = []
 
     try:
-        with open(caminho, "r", encoding="utf-8", errors="replace") as arquivo:
+        with open(caminho, encoding="utf-8", errors="replace") as arquivo:
             for linha in arquivo:
                 linha = linha.strip()
 

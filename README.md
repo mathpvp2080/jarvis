@@ -22,8 +22,11 @@ python iniciar_jarvis.py
 O `iniciar_jarvis.py` confere o ambiente, sobe o processo de voz (`main.py`) e
 a interface (`jarvis_tela.py`) e encerra os dois se um deles cair.
 
-Se algo não funcionar, **`jarvis.log`** (na pasta do projeto) tem o motivo —
-todos os erros são registrados lá, além de aparecerem no painel.
+Se algo não funcionar, os logs (na pasta do projeto) têm o motivo — todos os
+erros são registrados lá, além de aparecerem no painel:
+
+* **`jarvis.log`** — processo de voz (`main.py`)
+* **`jarvis.tela.log`** — interface (`jarvis_tela.py`)
 
 ## O que ele entende
 
@@ -61,6 +64,7 @@ modelo local (Ollama, `qwen2.5:3b` em `127.0.0.1:11434`).
 | `jarvis_tts.py` | fala em processo persistente (com interrupção) |
 | `preparar_modelos.py` | baixa/copia os modelos da câmera |
 | `DIAGNOSTICO.md` | diagnóstico técnico completo + status do que foi corrigido |
+| `jarvis.log` / `jarvis.tela.log` | log de cada processo (voz / interface), rotativos |
 | `config_jarvis.json` | preferências (câmera, gestos, holograma, microfone, voz) |
 | `memoria_jarvis.jsonl` | histórico da conversa (uma linha por mensagem) |
 
@@ -72,10 +76,13 @@ Rodam em qualquer sistema (não precisam de Windows, microfone nem câmera):
 python -m unittest discover -s testes -t .
 ```
 
-73 testes: detecção de voz, cadeia de reconhecimento, camada de intenções,
-rotas de comando do `main.py` (com 23 comandos reais do histórico), protocolo
-da fala e uma fumaça da interface. `testes/comparar_antigo_novo.py` mostra o
-antes/depois do detector de voz lado a lado.
+106 testes: detecção de voz, cadeia de reconhecimento, camada de intenções
+(inclusive a extração do argumento — o nome da música, o termo da busca, a
+descrição da imagem), rotas de comando do `main.py` (com 23 comandos reais do
+histórico, cache de aplicativos, confirmação de nome parecido e escala de vídeo),
+protocolo da fala, log por processo e uma fumaça da interface.
+`testes/comparar_antigo_novo.py` mostra o antes/depois do detector de voz lado a
+lado.
 
 ## Configurações do painel
 
