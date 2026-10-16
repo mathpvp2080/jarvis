@@ -4,7 +4,21 @@ Assistente de voz em português, para Windows: fala, escuta, olha pela câmera
 (gestos, humor, holograma) e tem uma interface própria em PySide6 com navegador
 embutido, painel do sistema e histórico da conversa.
 
-## Como rodar
+## Como instalar (dois cliques)
+
+1. Instale o **[Python 3.12](https://www.python.org/downloads/)** — marque
+   **"Add Python to PATH"** na primeira tela. (Se pular isso, o `instalar.bat`
+   avisa e abre a página certa.)
+2. Baixe o projeto e descompacte.
+3. Dois cliques em **`instalar.bat`** — ele cria o ambiente, instala as
+   dependências, baixa os modelos da câmera e confere o Ollama.
+4. Depois, dois cliques em **`iniciar.bat`** para abrir.
+
+O [Ollama](https://ollama.com/download) é o único item que não dá para instalar
+por aqui (é um instalador próprio); o `instalar.bat` avisa se ele faltar e abre
+a página de download. O modelo de conversa (`qwen2.5:3b`) ele baixa sozinho.
+
+## Como rodar (na mão)
 
 ```powershell
 cd <pasta do jarvis>
@@ -87,6 +101,8 @@ decisão em `jarvis_agente.py` (como decide). O registro sai em JSON
 |---|---|
 | `main.py` | processo de voz: rotas de comando, tela/OCR, música, Ollama, memória |
 | `jarvis_tela.py` | interface: câmera, gestos, holograma, navegador, chat, bandeja |
+| `instalar.bat` / `iniciar.bat` | instalação e abertura com dois cliques no Windows |
+| `instalar_jarvis.py` | os passos do instalador (modelos da câmera, Ollama, Tesseract) |
 | `iniciar_jarvis.py` | abre os dois processos e cuida deles |
 | `jarvis_comum.py` | log, JSON atômico, filas entre os processos (sem corrida) |
 | `jarvis_audio.py` | microfone + detecção de voz adaptativa (thread própria) |
@@ -110,12 +126,13 @@ Rodam em qualquer sistema (não precisam de Windows, microfone nem câmera):
 python -m unittest discover -s testes -t .
 ```
 
-158 testes: detecção de voz, cadeia de reconhecimento, camada de intenções
+188 testes: detecção de voz, cadeia de reconhecimento, camada de intenções
 (inclusive a extração do argumento — o nome da música, o termo da busca, a
 descrição da imagem), rotas de comando do `main.py` (com 23 comandos reais do
 histórico, cache de aplicativos, confirmação de nome parecido e escala de vídeo),
 protocolo da fala, log por processo, o registro de ferramentas, o laço do agente
-(com um modelo de mentira, sem rede) e uma fumaça da interface.
+(com um modelo de mentira, sem rede), o orçamento de tempo do turno, o
+instalador e uma fumaça da interface.
 `testes/comparar_antigo_novo.py` mostra o antes/depois do detector de voz lado a
 lado.
 

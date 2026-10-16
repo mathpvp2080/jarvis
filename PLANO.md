@@ -20,6 +20,10 @@ roteamento híbrido, confirmação para ação perigosa, dois recuos.
 
 ---
 
+## ✅ Passo 0.5 — Instalação em dois cliques
+`instalar.bat` / `iniciar.bat` + `instalar_jarvis.py` (decisões testáveis).
+**188 testes.**
+
 ## Fase B — Memória (6 passos)
 
 | # | Passo | Entrega visível | Toca |

@@ -218,10 +218,10 @@ Itens 2, 3 e 4 são os que mais provavelmente explicam travamentos silenciosos n
 # Status da implementação (11/10/2026)
 
 Tudo o que está marcado como ✅ foi implementado e tem teste automatizado.
-Os testes rodam **sem Windows** (158 testes, `python -m unittest discover -s testes -t .`):
+Os testes rodam **sem Windows** (188 testes, `python -m unittest discover -s testes -t .`):
 
 ```
-Ran 158 tests — OK (skipped=1: fumaça da interface, precisa de PySide6 + OpenGL)
+Ran 188 tests — OK (skipped=1: fumaça da interface, precisa de PySide6 + OpenGL)
 ```
 
 ## Fase 1 — Observabilidade e não-travar
@@ -351,6 +351,13 @@ auditoria e recuos), `main.py` (as 16 ferramentas e o roteamento híbrido),
 
 **Não entrou nesta rodada:** máquina de estados visual no painel, wake word
 local, memória semântica e proatividade — estão nas fases B–E do `VISAO.md`.
+
+## Rodada de 16/10/2026 (3) — orçamento de tempo e instalação em dois cliques
+
+| # | Antes | Depois |
+|---|---|---|
+| T1 | O turno do agente podia esperar 4 rodadas de 60 s (o teto de ferramenta estava declarado e nunca usado) | `ORCAMENTO_DO_TURNO` (90 s) cobre modelo + ferramentas; cada chamada recebe só o que sobrou; acabou o tempo, o Jarvis avisa em voz alta em vez de esperar calado. A ferramenta roda em thread com teto de 30 s e o turno segue sem ela |
+| T2 | Sem instalação guiada: quem quisesse rodar precisava de PowerShell, pip e ler o README | `instalar.bat` + `iniciar.bat` (dois cliques). O `instalar.bat` acha o Python (e avisa se não tiver 3.11+), cria o `.venv`, instala tudo, baixa os modelos da câmera, confere o Ollama e baixa o modelo de conversa. As decisões ficaram em `instalar_jarvis.py`, testáveis em qualquer sistema |
 
 ## O que continua pendente
 
