@@ -155,7 +155,7 @@ PALAVRAS_DE_DESLIGAR = frozenset({
 VERBOS_DE_LIGACAO = frozenset({
     "ver", "ve", "olha", "olhar", "fala", "falar", "diz", "dizer",
     "faz", "fazer", "pode", "poderia", "sabe", "saber",
-    "entende", "entender", "quero", "queria", "queria",
+    "entende", "entender", "quero", "queria",
 })
 
 PALAVRAS_SEM_CONTEUDO = (
@@ -364,6 +364,139 @@ def _tirar_pedido_educado(texto_canonico: str) -> str:
     return " ".join(palavras)
 
 
+# --------------------------------------------------------------------------
+# Extração do argumento
+# --------------------------------------------------------------------------
+#
+# O argumento é o que sobra da frase depois do verbo, e é ele que vira a
+# busca no YouTube, o nome do programa ou o texto da imagem. Duas coisas o
+# estragavam:
+#
+# 1. o vocabulário do próprio comando ia junto ("gerar *imagem* de um dragão"
+#    devolvia "imagem dragao", e a busca saía por "imagem dragao");
+# 2. a limpeza era feita em main.py com `str.replace`, sem fronteira de
+#    palavra: "toque" era removido de dentro de "Toque de Midas" e a música
+#    virava "de midas".
+#
+# Aqui a limpeza é por **palavras inteiras**, com um dicionário por intenção.
+
+PALAVRAS_FORA_DO_ARGUMENTO = {
+    "gerar_imagem": frozenset({
+        "imagem", "imagens", "foto", "fotos", "figura", "ilustracao",
+        "desenho", "gravura", "arte", "wallpaper", "papel", "parede",
+    }),
+    "tocar_musica": frozenset({
+        "musica", "musicas", "music", "musics", "música", "som", "faixa",
+        "faixas", "musical", "youtube", "you", "tube", "video", "clipe",
+        "playlist", "spotify", "tocando", "reproducao", "track", "song",
+    }),
+    "pesquisar": frozenset({
+        "internet", "web", "google", "pesquisa", "youtube", "you", "tube",
+        "navegador", "rede",
+    }),
+    "clicar_em": frozenset({"clique", "botao", "tela", "cima"}),
+    "abrir_aplicativo": frozenset({
+        "programa", "aplicativo", "aplicativos", "app", "apps", "software",
+    }),
+}
+
+# Enchimento aceito dentro de um argumento. É **menor** que ENCHIMENTO de
+# propósito: "pôr do sol" não pode virar "sol" só porque "pôr"/"por" está na
+# lista de palavras ignoráveis da comparação de comandos.
+ENCHIMENTO_DE_ARGUMENTO = frozenset({
+    "o", "a", "os", "as", "um", "uma", "uns", "umas",
+    "de", "do", "da", "dos", "das", "em", "no", "na", "nos", "nas",
+    "me", "meu", "minha", "meus", "minhas", "seu", "sua",
+    "ai", "entao", "agora", "apenas", "aqui", "la", "ja",
+    "ei", "oi", "ola", "hey", "porfavor", "favor", "gentileza", "mim",
+})
+
+# Lixo que costuma vir antes do argumento ("para abrir o chrome",
+# "pesquise sobre buracos negros").
+LIXO_INICIAL_DO_ARGUMENTO = ENCHIMENTO_DE_ARGUMENTO | frozenset({
+    "que", "para", "pra", "pro", "com", "sem", "sobre", "sob",
+    "acerca", "referente", "relativo",
+})
+# "por" ficou de fora de propósito: depois de tirar o acento, "pôr do sol"
+# começa exatamente com "por".
+
+# Lixo que costuma vir depois ("abre o chrome ai agora").
+LIXO_FINAL_DO_ARGUMENTO = ENCHIMENTO_DE_ARGUMENTO | PEDIDOS_EDUCADOS | frozenset({
+    "ai", "ja", "agora", "so", "apenas", "porfavor", "favor", "obrigado",
+    "obrigada", "valeu", "beleza", "mim", "pra", "para", "pro", "por",
+})
+
+
+def extrair_argumento(palavras: list, nome_intencao: str = "") -> str:
+    """Devolve só o que interessa do comando, em palavras inteiras.
+
+    ``palavras`` é a frase como foi dita (normalizada: minúsculas, sem acento,
+    sem pontuação), **sem** o verbo do comando. Nada de ``str.replace``: cada
+    token é comparado por inteiro, então "toque" dentro de "Toque de Midas"
+    sobrevive.
+
+    Três cuidados que esta função existe para garantir:
+
+    * **só as bordas são aparadas.** Artigos e preposições do **miolo** fazem
+      parte do nome ("toque *de* midas", "bloco *de* notas") — removê-los
+      estragava a busca;
+    * **a remoção é repetida até estabilizar**, porque o lixo se encadeia: em
+      "back in black no youtube music", tirar "youtube" expõe "music", que
+      também é vocabulário do comando;
+    * **nada de frase canônica aqui.** Canonicalizar troca "mim" por "pausar"
+      e "toca" por "tocar"; no argumento isso virava lixo.
+    """
+
+    fora = PALAVRAS_FORA_DO_ARGUMENTO.get(nome_intencao, frozenset())
+    palavras = [palavra for palavra in palavras if palavra]
+
+    while True:
+        antes = list(palavras)
+
+        # -- borda inicial: "para", "sobre", "imagem", artigos... -----------
+        while palavras and (palavras[0] in LIXO_INICIAL_DO_ARGUMENTO or palavras[0] in fora):
+            palavras = palavras[1:]
+
+        # -- borda final: "agora", "por favor", "youtube"... ----------------
+        while palavras and (palavras[-1] in LIXO_FINAL_DO_ARGUMENTO or palavras[-1] in fora):
+            palavras = palavras[:-1]
+
+        # -- cauda de plataforma no meio/fim: "no youtube music" ------------
+        if fora:
+            inicio_cauda = next(
+                (indice for indice, palavra in enumerate(palavras) if palavra in fora),
+                None,
+            )
+
+            if inicio_cauda is not None:
+                cabeca = palavras[:inicio_cauda]
+                cauda = palavras[inicio_cauda:]
+
+                # O que vem depois da cauda só é aproveitado se trouxer
+                # conteúdo de verdade (2+ palavras). Assim o "music" que sobra
+                # de "youtube music" vai embora junto.
+                resto = [
+                    palavra for palavra in cauda
+                    if palavra not in fora and palavra not in ENCHIMENTO_DE_ARGUMENTO
+                ]
+                cortada = cabeca if len(resto) < 2 else cabeca + resto
+
+                if cortada:
+                    palavras = cortada
+
+        # -- verbo no fim, como pedido: "coloca jazz pra tocar" -------------
+        while len(palavras) >= 2 and (
+            palavras[-1] in EQUIVALENTES_DE_VERBO
+            and palavras[-2] in PEDIDOS_EDUCADOS | {"para", "pra", "pro", "por"}
+        ):
+            palavras = palavras[:-2]
+
+        if palavras == antes:
+            break
+
+    return " ".join(palavras).strip()
+
+
 NEGACOES_INICIAIS = ("nao", "nunca", "nem")
 
 
@@ -443,6 +576,69 @@ def _parecenca_por_janela(texto: str, gatilho: str) -> float:
     return melhor
 
 
+def tirar_verbo_inicial(palavras: list, nome_intencao: str = "") -> list:
+    """Tira o verbo que comanda o pedido ("tocar X", "pesquisar Y").
+
+    Usado por quem recebe a **frase inteira** (o texto digitado no painel, por
+    exemplo) em vez do argumento já recortado pela camada de intenções.
+
+    Existe um caso ambíguo de verdade: "toque de midas" pode ser o pedido
+    "*toque* De Midas" ou só o título da música. A regra aqui é conservadora —
+    corta o verbo e **desfaz o corte** quando o que sobra não é um pedido
+    utilizável (nada, ou só vocabulário do comando, como "no youtube"). Assim
+    "tocar no youtube" não vira uma busca por "youtube", e "toque de midas"
+    continua inteiro.
+    """
+
+    palavras = list(palavras)
+
+    while palavras and palavras[0] in PEDIDOS_EDUCADOS:
+        palavras = palavras[1:]
+
+    if not palavras or palavras[0] not in EQUIVALENTES_DE_VERBO:
+        return palavras
+
+    sem_verbo = palavras[1:]
+
+    if sem_verbo and extrair_argumento(sem_verbo, nome_intencao):
+        return sem_verbo
+
+    return palavras
+
+
+def _argumento_do_verbo(frase_normalizada: str, definicao: _Definicao) -> str:
+    """O que o usuário pediu, tirando o verbo e o vocabulário do comando.
+
+    Duas regras que esta função existe para garantir:
+
+    * **não usar a frase canônica** no argumento. Canonicalizar troca "mim" por
+      "pausar" e "toca" por "tocar"; no argumento isso virava lixo
+      ("abre o chrome para mim" → "chrome pausar"). Aqui só o **verbo** é
+      canonicalizado, para saber onde ele termina — o resto fica como foi dito.
+    * **não usar a frase sem enchimento**. "gerar imagem pôr do sol" precisa do
+      "pôr" (que a comparação de comandos ignora) para a busca fazer sentido.
+    """
+
+    cruas = frase_normalizada.split()
+    verbos = set(definicao.verbos)
+    indice_verbo = None
+
+    for indice, palavra in enumerate(cruas):
+        if indice > 3:
+            # Verbo além da 4ª palavra não comanda a frase ("quero que você
+            # toque..." é conversa) — deixa para o fuzzy decidir.
+            break
+
+        if palavra in verbos or EQUIVALENTES_DE_VERBO.get(palavra) in verbos:
+            indice_verbo = indice
+            break
+
+    if indice_verbo is None:
+        return ""
+
+    return extrair_argumento(cruas[indice_verbo + 1:], definicao.nome)
+
+
 def reconhecer(texto: str) -> Intencao | None:
     """Devolve a intenção mais provável da frase, ou ``None``.
 
@@ -499,7 +695,7 @@ def reconhecer(texto: str) -> Intencao | None:
             palavras = enxuto_sem_educacao.split()
 
             if palavras and palavras[0] in definicao.verbos:
-                argumento = " ".join(palavras[1:]).strip()
+                argumento = _argumento_do_verbo(frase, definicao)
                 confianca = 0.95 if argumento else 0.72
                 candidatos.append(
                     Intencao(definicao.nome, confianca, argumento, palavras[0], frase)

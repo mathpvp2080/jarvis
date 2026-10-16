@@ -218,17 +218,17 @@ Itens 2, 3 e 4 são os que mais provavelmente explicam travamentos silenciosos n
 # Status da implementação (11/10/2026)
 
 Tudo o que está marcado como ✅ foi implementado e tem teste automatizado.
-Os testes rodam **sem Windows** (73 testes, `python -m unittest discover -s testes -t .`):
+Os testes rodam **sem Windows** (188 testes, `python -m unittest discover -s testes -t .`):
 
 ```
-Ran 73 tests — OK
+Ran 188 tests — OK (skipped=1: fumaça da interface, precisa de PySide6 + OpenGL)
 ```
 
 ## Fase 1 — Observabilidade e não-travar
 
 | Bug | Situação | Como |
 |---|---|---|
-| B1 (sem log) | ✅ | `jarvis_comum.configurar_log()` grava `jarvis.log` (rotativo, 2 MB × 3) nos dois processos; **todos** os `except` genéricos passaram a registrar `log.exception` antes de falar |
+| B1 (sem log) | ✅ | `jarvis_comum.configurar_log()` grava log rotativo (2 MB × 3) **um arquivo por processo** — `jarvis.log` (voz) e `jarvis.tela.log` (interface); **todos** os `except` genéricos passaram a registrar `log.exception` antes de falar |
 | B4 (fechar janela mata a câmera) | ✅ | o **X só esconde** (não existe mais `close()` de detetor em uso); `detect()` roda dentro de `try` no timer; `liberar_camera()` é chamado uma única vez, com flag. Teste de bancada: `detect()` após `close()` → `ValueError: Task runner is currently not running.` — reproduzido e explicado |
 | B7 (bloqueio do PC ligado por padrão) | ✅ | padrão agora é `false`; mesmo ligado: exige câmera saudável, 1 min de sessão e **avisa 10 s antes** |
 | B12 (sem excepthook) | ✅ | `registrar_excecoes_nao_tratadas()` nos dois processos — log + aviso na tela (com limite de frequência) |
@@ -297,8 +297,75 @@ o PC e abre o Jarvis na sequência. Agora o campo nasce `None` e a comparação 
 acontece quando não é `None`
 (`testes/teste_voz.py::test_nao_repete_aviso_em_loop` cobre o caso).
 
+## Rodada de 12/10/2026 — o que os testes novos pegaram
+
+Depois do diagnóstico, uma passada de verificação **executando** o código (em
+Linux, sem Windows/microfone/câmera) achou seis defeitos que nenhum dos 73
+testes cobria. Todos corrigidos, com teste:
+
+| # | Defeito | Efeito prático | Correção |
+|---|---|---|---|
+| C1 | O argumento da intenção saía da frase **sem enchimento** e era limpo em `main.py` com `str.replace` | *"gerar imagem de um dragão"* buscava **"imagem dragao"**; *"toca toque de midas no youtube"* buscava **"de midas"** (o "toque" do verbo era removido de dentro do título); *"abre o chrome para mim"* virava **"chrome pausar"** (canonicalizar troca "mim" por "pausar") | `jarvis_intencoes.extrair_argumento()` + `_argumento_do_verbo()`: limpeza **por palavra inteira**, com dicionário de vocabulário por intenção (`PALAVRAS_FORA_DO_ARGUMENTO`), miolo preservado ("toque **de** midas", "bloco **de** notas") e corte repetido da cauda de plataforma ("youtube music" sai inteiro). O argumento passa a vir da frase normalizada, não da canônica nem da versão sem enchimento |
+| C2 | Pedido sem o essencial caía na faixa de confirmação | *"gerar imagem"* perguntava "Você quis dizer: gerar uma imagem?" — que não diz nada | `main.argumento_que_falta()`: quando falta o argumento, o Jarvis pergunta o que falta ("Diga o que você quer na imagem") em vez de confirmar o vazio |
+| C3 | `listar_aplicativos()` rodava `Get-StartApps` **a cada** "abrir X" | o laço principal travava por segundos no comando mais usado do histórico | cache de 10 min (`CACHE_DE_APLICATIVOS`); lista vazia (falha) é tentada de novo em 30 s, não fica 10 min guardada |
+| C4 | Nome parecido abria o programa **sem perguntar** (`difflib` cutoff 0,78) | "abrir chrome" podia abrir outro programa | vira confirmação pelo fluxo que já existia (`pedir_confirmacao` ganhou `pergunta=` própria); nome exato continua abrindo direto |
+| C5 | Clique assistido não considerava a escala de vídeo | com o Windows em 125%/150% (padrão em notebook), o OCR devolve pixel físico e o `pyautogui.click` usa coordenada lógica → **clica em outro lugar** | `configurar_escalas_de_video()` (DPI aware: per-monitor v2 → por monitor → sistema), `escala_de_video()` e `para_coordenadas_de_clique()`; conversão registrada em log |
+| C6 | Os dois processos dividiam **um** `RotatingFileHandler` | no Windows a rotação renomeia o arquivo que o outro processo tem aberto: erro na rotação e perda de log justo na hora de investigar | `jarvis_comum.arquivo_de_log()`: um arquivo por processo (`jarvis.log`, `jarvis.tela.log`); `configurar_log` passou a ser idempotente **por nome**; `iniciar_jarvis.ultimas_linhas_do_log()` lê os dois e mistura por horário |
+
+Também saíram dois arquivos que a fila nova (`fila_comandos/`, `fila_eventos/`)
+tornou mortos: `comandos_interface.json` e `eventos_interface.json` (nenhuma
+linha de código os lia).
+
+Testes novos: `testes/teste_intencoes.py::TesteExtracaoDoArgumento` (10) e, em
+`testes/teste_comandos.py`, `TesteNomeDaMusica`, `TesteGerarImagem`,
+`TesteEscalaDeVideo`, `TesteCacheDeAplicativos` e `TesteLogPorProcesso` (23).
+
+### Limitação conhecida (documentada, não corrigida)
+
+Um título que **é** um verbo conjugado, dito sem o verbo do comando ("toque de
+midas" digitado no painel), perde a primeira palavra na busca — vira "midas". O
+caso é ambíguo de verdade (é verbo ou é título?) e a regra ficou conservadora:
+só corta quando o resto não diz nada por si. Pela voz o problema não aparece,
+porque a frase vem com o verbo ("toca toque de midas").
+
+## Rodada de 16/10/2026 — o cérebro virou agente
+
+O projeto tinha **casca** de Jarvis e **cérebro** de menu de opções: a lista de
+frases decidia tudo, e o modelo de linguagem só entrava quando nada era
+reconhecido — proibido de agir, ele às vezes *afirmava* ter feito algo que não
+fez. Agora o modelo recebe as ferramentas e decide (`jarvis_agente.py`), com o
+reconhecedor antigo como caminho rápido.
+
+| # | Antes | Depois |
+|---|---|---|
+| A1 | Pedido novo não existe na lista e vira conversa ("abre o chrome e pesquisa o preço do ssd" → **abria o chrome com o resto dentro do argumento**) | O laço recebe 16 ferramentas em `tools`, executa **todas** as chamadas do turno, devolve o resultado ao modelo e responde |
+| A2 | O modelo afirmava ter executado ação (defesa era uma frase no prompt) | Ele só afirma depois de ver o resultado da ferramenta; a ação aconteceu de verdade porque foi ele que pediu |
+| A3 | Ferramenta que estoura derrubava o turno | Toda falha vira texto de resultado (`executar_ferramenta`); teto de 4 rodadas e 6 ferramentas por turno |
+| A4 | Ação perigosa por conversa não tinha freio | `corrigir_texto`, `esconder_painel` e `sair_da_jarvis` passam pela confirmação de sim/não que já existia |
+| A5 | Fala dupla seria o risco óbvio (função antiga fala + modelo resume) | `fala_sozinha` na ferramenta: quando a função antiga já fala, o texto do modelo não é falado |
+| A6 | Modelo/Ollama sem suporte a `tools` quebraria tudo | Recuo automático para um protocolo de texto (JSON no prompt) e, se nem isso, para a conversa antiga |
+
+Arquivos: `jarvis_ferramentas.py` (registro + schema), `jarvis_agente.py` (laço,
+auditoria e recuos), `main.py` (as 16 ferramentas e o roteamento híbrido),
+`testes/teste_agente.py` (52 testes, com modelo de mentira — sem rede).
+
+**Não entrou nesta rodada:** máquina de estados visual no painel, wake word
+local, memória semântica e proatividade — estão nas fases B–E do `VISAO.md`.
+
+## Rodada de 16/10/2026 (3) — orçamento de tempo e instalação em dois cliques
+
+| # | Antes | Depois |
+|---|---|---|
+| T1 | O turno do agente podia esperar 4 rodadas de 60 s (o teto de ferramenta estava declarado e nunca usado) | `ORCAMENTO_DO_TURNO` (90 s) cobre modelo + ferramentas; cada chamada recebe só o que sobrou; acabou o tempo, o Jarvis avisa em voz alta em vez de esperar calado. A ferramenta roda em thread com teto de 30 s e o turno segue sem ela |
+| T2 | Sem instalação guiada: quem quisesse rodar precisava de PowerShell, pip e ler o README | `instalar.bat` + `iniciar.bat` (dois cliques). O `instalar.bat` acha o Python (e avisa se não tiver 3.11+), cria o `.venv`, instala tudo, baixa os modelos da câmera, confere o Ollama e baixa o modelo de conversa. As decisões ficaram em `instalar_jarvis.py`, testáveis em qualquer sistema |
+
 ## O que continua pendente
 
-* **B15 completo** — thread separada para a câmera (hoje só a mitigação de cadência).
+* **B15 completo** — thread separada para a câmera (hoje só a mitigação de cadência). É o maior custo que resta na interface: rosto + expressões + mãos rodam no timer da GUI a cada 220 ms.
+* **Caminho do "gerar imagem"** — hoje abre uma busca de imagens e avisa que não gera; um gerador local (ComfyUI/A1111) ou API continua por fazer.
+* **Memória** — `buscar_memorias_relevantes` é interseção de palavras sobre as últimas 2.000 linhas; não há SQLite/embedding, então o Jarvis não guarda fato nenhum sobre a pessoa.
+* **LLM que afirma ter executado ação** — resolvido na rodada de 16/10 para o caminho do agente (ele só fala depois de ver o resultado da ferramenta). Continua valendo para a conversa solta, que não tem ferramenta nenhuma para chamar.
+* **CI** — não há GitHub Actions: os 106 testes só rodam quando alguém lembra. `pyproject.toml`/pin de versões também não existem.
+* **`import main` tem efeito colateral** — migra a memória legada, configura log e cria o mutex no import; os testes só não sujam o repositório porque o `.gitignore` cobre os arquivos.
 * **Reconhecimento offline mais preciso** — instalar `faster-whisper` (`pip install faster-whisper`) ou o modelo pt-BR do Vosk; o app já usa automaticamente se existir.
 * **Teste em Windows** — pelo checklist abaixo; os modelos `.task` precisam ser baixados uma vez (`python preparar_modelos.py`).

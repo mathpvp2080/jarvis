@@ -1061,7 +1061,7 @@ class JanelaJarvis(QMainWindow):
                 break
 
             self._proximo_aviso_de_erro = agora + 15
-            self.mostrar_aviso("Ocorreu um erro interno. Veja jarvis.log", mensagem, "erro")
+            self.mostrar_aviso("Ocorreu um erro interno. Veja jarvis.tela.log", mensagem, "erro")
 
     def atualizar_camera(self):
         """Ponto de entrada do timer da câmera: nunca pode derrubar o app.
@@ -1084,7 +1084,7 @@ class JanelaJarvis(QMainWindow):
                 log.exception("Falha ao atualizar a câmera")
 
             try:
-                self.camera_status.setText("● Câmera com erro — veja jarvis.log")
+                self.camera_status.setText("● Câmera com erro — veja jarvis.tela.log")
             except Exception:
                 pass
 

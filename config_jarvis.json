@@ -6,5 +6,8 @@
   "detectar_emocoes": true,
   "exoesqueleto_facial": true,
   "holograma_ativado": true,
-  "reagir_a_gestos": true
+  "reagir_a_gestos": true,
+  "agente_ativado": true,
+  "modelo_local": "qwen2.5:3b",
+  "rodadas_do_agente": 4
 }

@@ -369,9 +369,11 @@ class GerenciadorDeVoz:
 
         agora = time.monotonic()
 
-        if self.ultimo_aviso is not None:
-            if agora - self.ultimo_aviso < INTERVALO_MINIMO_ENTRE_AVISOS:
-                return False
+        if (
+            self.ultimo_aviso is not None
+            and agora - self.ultimo_aviso < INTERVALO_MINIMO_ENTRE_AVISOS
+        ):
+            return False
 
         self.ultimo_aviso = agora
         return True

@@ -1,4 +1,4 @@
-﻿import atexit
+import atexit
 import base64
 import ctypes
 import difflib
@@ -21,6 +21,7 @@ import pytesseract
 from PIL import Image
 
 from jarvis_audio import DetectorDeVoz, ThreadOuvinte
+from jarvis_agente import Agente
 from jarvis_comum import (
     anexar_jsonl,
     configurar_log,
@@ -32,12 +33,23 @@ from jarvis_comum import (
     registrar_excecoes_nao_tratadas,
 )
 from jarvis_intencoes import (
+    ENCHIMENTO_DE_ARGUMENTO,
+    EQUIVALENTES_DE_VERBO,
+    LIXO_INICIAL_DO_ARGUMENTO,
+    PALAVRAS_FORA_DO_ARGUMENTO,
+    Intencao,
     descrever as descrever_intencao,
+    extrair_argumento,
     normalizar,
     quer_ligar,
     reconhecer,
 )
 from jarvis_tts import MotorDeFala
+from jarvis_ferramentas import (
+    Ferramenta,
+    RegistroDeFerramentas,
+    executar_ferramenta,
+)
 from jarvis_voz import GerenciadorDeVoz
 
 log = configurar_log("jarvis")
@@ -80,6 +92,11 @@ ARQUIVO_COMANDOS_APRENDIDOS = PASTA / "comandos_aprendidos.json"
 
 CAMINHO_TESSERACT = shutil.which("tesseract") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
+# Por quanto tempo a lista de aplicativos do menu Iniciar é reaproveitada.
+CACHE_DE_APLICATIVOS = 600.0
+_aplicativos_cache: dict = {}
+_aplicativos_cache_ate = 0.0
+
 pytesseract.pytesseract.tesseract_cmd = CAMINHO_TESSERACT
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -118,6 +135,94 @@ def localizar_ollama():
 
 CAMINHO_OLLAMA = localizar_ollama()
 
+# Preenchido no início do laço (configurar_escalas_de_video).
+DPI_DECLARADO = False
+
+
+def configurar_escalas_de_video():
+    """Declara ao Windows que este processo enxerga a escala de vídeo real.
+
+    Por que importa: a captura de tela (mss) e o OCR devolvem coordenadas em
+    **pixels físicos**, enquanto o clique do pyautogui usa as coordenadas
+    **lógicas** do processo. Com a escala em 125%/150% (padrão em muito
+    notebook) os dois sistemas não batem e o "clicar em confirmar" acerta outro
+    lugar da tela. Sem declarar nada, o processo fica *unaware* e o Windows
+    ainda estica a janela — pior dos dois lados.
+
+    Devolve True quando ficou sabendo da escala (per-pixel ou system), o que já
+    basta para as coordenadas casarem.
+    """
+
+    if os.name != "nt":
+        return False
+
+    for nome in (
+        "SetProcessDpiAwarenessContext",  # Windows 10 1703+: -4 = per-monitor v2
+        "SetProcessDpiAwareness",        # Windows 8.1+: 2 = por monitor
+        "SetProcessDPIAware",            # Windows Vista+: sistema
+    ):
+        try:
+            if nome == "SetProcessDpiAwarenessContext":
+                ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+            elif nome == "SetProcessDpiAwareness":
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            else:
+                ctypes.windll.user32.SetProcessDPIAware()
+
+            log.info("Escala de vídeo declarada ao Windows (%s)", nome)
+            return True
+        except (AttributeError, OSError):
+            continue
+        except Exception:
+            log.exception("Não consegui declarar a escala de vídeo (%s)", nome)
+            continue
+
+    log.warning(
+        "Processo sem consciência de DPI: com escala diferente de 100%% o "
+        "clique assistido pode acertar outro ponto da tela"
+    )
+    return False
+
+
+def escala_de_video():
+    """Fator entre pixels físicos e lógicos (1.0 = escala em 100%).
+
+    SM_CXVIRTUALSCREEN (78) e SM_CYVIRTUALSCREEN (79) vêm em pixels físicos;
+    a largura/altura "lógicas" do sistema vêm das métricas 0 e 1.
+    """
+
+    if os.name != "nt":
+        return 1.0
+
+    try:
+        usuario32 = ctypes.windll.user32
+        fisico = usuario32.GetSystemMetrics(78)
+        logico = usuario32.GetSystemMetrics(0)
+
+        if fisico and logico:
+            return round(fisico / logico, 4)
+    except Exception:
+        log.exception("Não consegui medir a escala de vídeo")
+
+    return 1.0
+
+
+def para_coordenadas_de_clique(x, y, escala=None):
+    """Converte um ponto da captura de tela para o sistema do mouse.
+
+    Quando o processo já é *DPI aware* (veja ``configurar_escalas_de_video``),
+    a escala é 1.0 e o ponto passa inteiro. Se não deu para declarar, a
+    conversão evita que o clique saia pela metade da tela.
+    """
+
+    if escala is None:
+        escala = escala_de_video()
+
+    if not escala or escala == 1.0:
+        return int(x), int(y)
+
+    return int(round(x / escala)), int(round(y / escala))
+
 clique_pendente = None
 intencao_pendente = None
 processo_fala = None
@@ -150,6 +255,10 @@ def carregar_config():
         "limiar_minimo_de_voz": 45,
         "multiplicador_de_ruido": 1.8,
         "silencio_para_encerrar": 1.0,
+        # Cérebro (agente com ferramentas) — veja jarvis_agente.py
+        "agente_ativado": True,
+        "modelo_local": MODELO_LOCAL,
+        "rodadas_do_agente": 4,
     }
 
     dados = ler_json(ARQUIVO_CONFIG, {})
@@ -157,6 +266,30 @@ def carregar_config():
         padrao.update(dados)
 
     return padrao
+
+
+def modelo_local():
+    """Modelo do Ollama a usar (o `config_jarvis.json` manda)."""
+
+    try:
+        return str(carregar_config().get("modelo_local") or MODELO_LOCAL)
+    except Exception:
+        return MODELO_LOCAL
+
+
+def agente_ativado():
+    """O cérebro com ferramentas está ligado?
+
+    Fica atrás de configuração porque é a mudança mais estrutural do projeto:
+    desligar tem que devolver o comportamento antigo, de comando reconhecido,
+    sem tocar em mais nada.
+    """
+
+    try:
+        return bool(carregar_config().get("agente_ativado", True))
+    except Exception:
+        log.exception("Não consegui ler a configuração do agente")
+        return True
 
 
 def tela_permitida():
@@ -677,10 +810,18 @@ def preparar_clique(texto_procurado):
             )
             return
 
+        x, y = para_coordenadas_de_clique(posicao["x"], posicao["y"])
+
+        if (x, y) != (posicao["x"], posicao["y"]):
+            log.warning(
+                "Clique convertido da escala de vídeo %.2f: (%s, %s) -> (%s, %s)",
+                escala_de_video(), posicao["x"], posicao["y"], x, y,
+            )
+
         clique_pendente = {
             "texto": texto_procurado,
-            "x": posicao["x"],
-            "y": posicao["y"]
+            "x": x,
+            "y": y,
         }
 
         falar(
@@ -747,7 +888,7 @@ def perguntar_ao_ollama(instrucao):
     """
 
     dados = json.dumps({
-        "model": MODELO_LOCAL,
+        "model": modelo_local(),
         "prompt": instrucao,
         "stream": False,
         "options": {
@@ -828,14 +969,41 @@ def responder_com_ollama(pergunta):
         informar_interface("estado_voz", {"processando": False})
 
 
-def listar_aplicativos():
-    """Lista os aplicativos do menu Iniciar (Windows).
+def listar_aplicativos(forcar=False):
+    """Lista os aplicativos do menu Iniciar (Windows), com cache.
 
-    Antes, se o PowerShell não estivesse no PATH, o `subprocess.run` levantava
-    FileNotFoundError e o comando "abrir <app>" morria calado — justamente o
-    comando mais usado.
+    Dois problemas resolvidos aqui:
+
+    * antes, se o PowerShell não estivesse no PATH, o ``subprocess.run``
+      levantava FileNotFoundError e o comando "abrir <app>" morria calado —
+      justamente o comando mais usado;
+    * ``Get-StartApps`` é lento (centenas de apps) e rodava **a cada** "abrir
+      X", travando o laço principal por segundos. Agora a lista fica em cache
+      por 10 minutos; uma lista vazia (falha) é tentada de novo em 30 s.
     """
 
+    global _aplicativos_cache, _aplicativos_cache_ate
+
+    agora = time.monotonic()
+
+    if not forcar and _aplicativos_cache and agora < _aplicativos_cache_ate:
+        return dict(_aplicativos_cache)
+
+    aplicativos = _listar_aplicativos_do_windows()
+
+    if aplicativos:
+        _aplicativos_cache = aplicativos
+        _aplicativos_cache_ate = agora + CACHE_DE_APLICATIVOS
+    else:
+        # Falhou: não guarda o vazio por 10 minutos (senão o usuário fica sem
+        # conseguir abrir nada até o cache expirar).
+        _aplicativos_cache = {}
+        _aplicativos_cache_ate = agora + 30.0
+
+    return dict(aplicativos)
+
+
+def _listar_aplicativos_do_windows():
     if os.name != "nt":
         log.info("Listagem de aplicativos do menu Iniciar só existe no Windows")
         return {}
@@ -914,10 +1082,16 @@ def abrir_aplicativo(nome_falado):
     )
 
     if parecidos:
+        # Nome parecido não é nome certo: abrir o programa errado é pior do que
+        # perguntar. Antes o Jarvis abria direto o "mais parecido".
         nome_original, app_id = aplicativos[parecidos[0]]
-
-        if abrir_pelo_id(app_id):
-            falar(f"Abrindo {nome_original}.")
+        pedir_confirmacao(
+            Intencao("abrir_aplicativo", 0.80, nome_original, "parecido", nome_falado),
+            pergunta=(
+                f"Não encontrei {nome_falado}. "
+                f"Você quis dizer {nome_original}? Diga sim para eu abrir."
+            ),
+        )
     else:
         log.info("Aplicativo não encontrado: %r", nome_falado)
         falar(f"Não encontrei o aplicativo {nome_falado}.")
@@ -935,24 +1109,14 @@ def abrir_pelo_id(app_id):
         return False
 
 
-def pesquisar_na_internet(comando):
-    pesquisa = comando
+def termo_de_pesquisa(pedido):
+    """O que pesquisar, sem o verbo nem o "na internet" (palavras inteiras)."""
 
-    for inicio in [
-        "pesquisar por",
-        "pesquisar",
-        "pesquise por",
-        "pesquise",
-        "procure por",
-        "procura por",
-        "buscar por",
-        "buscar"
-    ]:
-        if pesquisa.startswith(inicio):
-            pesquisa = pesquisa.replace(inicio, "", 1).strip()
-            break
+    return _sem_verbo_inicial(pedido, "pesquisar")
 
-    pesquisa = pesquisa.replace("na internet", "").strip()
+
+def pesquisar_na_internet(pedido):
+    pesquisa = termo_de_pesquisa(pedido)
 
     if not pesquisa:
         falar("Diga o que você quer pesquisar.")
@@ -963,17 +1127,86 @@ def pesquisar_na_internet(comando):
     falar(f"Pesquisando por {pesquisa}.")
 
 
-def tocar_no_youtube(comando):
-    musica = comando
+def _sem_verbo_inicial(texto, nome_intencao):
+    """Tira o verbo e o vocabulário do comando do começo do pedido.
 
-    for trecho in [
-        "tocar", "toque", "colocar", "coloque",
-        "no youtube", "no you tube",
-        "youtube", "you tube"
-    ]:
-        musica = musica.replace(trecho, "")
+    Devolve ``""`` quando não sobra pedido nenhum — é o que faz o Jarvis
+    perguntar "qual música?" em vez de abrir uma busca por "youtube".
 
-    musica = musica.strip()
+    A regra do verbo é **conservadora** de propósito: ele só sai quando o resto
+    não diz nada por si ("tocar", "tocar no youtube", "pesquisar na internet").
+    Se o resto tem conteúdo, a primeira palavra pode muito bem ser o começo do
+    título — "toque de midas" e "toca do coelho" são os dois casos reais que
+    motivaram isto. Melhor sobrar um verbo na busca do que perder o título.
+    """
+
+    fora = PALAVRAS_FORA_DO_ARGUMENTO.get(nome_intencao, frozenset())
+    conectivos = ENCHIMENTO_DE_ARGUMENTO | LIXO_INICIAL_DO_ARGUMENTO
+    palavras = normalizar(texto).split()
+
+    def tem_conteudo(lista):
+        return any(
+            palavra not in fora
+            and palavra not in ENCHIMENTO_DE_ARGUMENTO
+            and palavra not in EQUIVALENTES_DE_VERBO
+            for palavra in lista
+        )
+
+    # "gerar imagem pôr do sol" digitado no painel repete o comando na frente.
+    # Só sai o que é claramente prefixo: o vocabulário do comando, ou o verbo
+    # seguido desse vocabulário. "toca" de "toca do coelho" não é prefixo.
+    while palavras:
+        if palavras[0] in fora:
+            palavras = palavras[1:]
+            continue
+
+        if len(palavras) > 1 and palavras[0] in EQUIVALENTES_DE_VERBO:
+            resto = palavras[1:]
+            if resto[0] in fora or (
+                resto[0] in conectivos and len(resto) > 1 and resto[1] in fora
+            ):
+                palavras = resto
+                continue
+
+        break
+
+    if not palavras:
+        return ""
+
+    # Verbo dito duas vezes ("toca toca do coelho"): o primeiro comanda. Só vale
+    # quando o segundo não começa um título ("toca toque de midas" tem "de" logo
+    # depois, então os dois fazem parte do nome).
+    if (
+        len(palavras) > 2
+        and palavras[0] in EQUIVALENTES_DE_VERBO
+        and palavras[1] in EQUIVALENTES_DE_VERBO
+        and palavras[2] not in conectivos
+        and tem_conteudo(palavras[2:])
+    ):
+        palavras = palavras[1:]
+
+    if palavras[0] in EQUIVALENTES_DE_VERBO:
+        if not tem_conteudo(palavras[1:]):
+            return ""
+
+        palavras = palavras[1:]
+
+    return extrair_argumento(palavras, nome_intencao)
+
+
+def nome_da_musica(pedido):
+    """Extrai o nome da música do pedido, por palavras inteiras.
+
+    Antes era uma sequência de ``str.replace`` sem fronteira de palavra: em
+    "Toque de Midas" o "toque" do verbo era removido **de dentro do título** e a
+    busca saía por "de midas".
+    """
+
+    return _sem_verbo_inicial(pedido, "tocar_musica")
+
+
+def tocar_no_youtube(pedido):
+    musica = nome_da_musica(pedido)
 
     if not musica:
         falar("Diga qual música você quer tocar.")
@@ -984,19 +1217,8 @@ def tocar_no_youtube(comando):
     falar(f"Abrindo {musica} no YouTube.")
 
 
-def tocar_no_youtube_music(comando):
-    musica = comando
-
-    for trecho in [
-        "tocar", "toque", "colocar", "coloque",
-        "no youtube music", "no you tube music",
-        "youtube music", "you tube music",
-        "na musica", "na música",
-        "musica do youtube", "música do youtube"
-    ]:
-        musica = musica.replace(trecho, "")
-
-    musica = musica.strip()
+def tocar_no_youtube_music(pedido):
+    musica = nome_da_musica(pedido)
 
     if not musica:
         falar("Diga qual música você quer tocar.")
@@ -1181,20 +1403,62 @@ def processar_comando(comando, profundidade=0):
 
     intencao = reconhecer(comando)
 
-    if intencao is None or intencao.nome in ("confirmar", "cancelar"):
+    if intencao is not None and intencao.nome in ("confirmar", "cancelar"):
+        intencao = None
+
+    # Caminho do agente: pedido encadeado ("abre o chrome e pesquisa X") ou
+    # pedido que o reconhecedor não entendeu. Se o agente não estiver ligado,
+    # ou não conseguir responder, tudo segue pelo caminho antigo logo abaixo.
+    if (
+        agente_ativado()
+        and (intencao is None or eh_comando_encadeado(comando_normalizado))
+        and responder_com_agente(comando, intencao_de_reserva=intencao)
+    ):
+        return True
+
+    if intencao is None:
         # Conversa livre (ou um "sim" sem nada pendente): vai para a IA local.
         informar_interface("estado_voz", {"processando": True, "motivo": "consultando a IA local"})
         responder_com_ollama(comando)
         return True
 
     if intencao.precisa_confirmar:
+        faltando = argumento_que_falta(intencao)
+
+        if faltando:
+            # "Gerar imagem." / "Você quis dizer: abrir um programa?" não dizem
+            # nada: o pedido veio sem o essencial, então pergunta-se o essencial.
+            falar(faltando)
+            return True
+
         return pedir_confirmacao(intencao)
 
     return executar_intencao(intencao)
 
 
-def pedir_confirmacao(intencao):
-    """Frase parecida com um comando: pergunta antes de agir."""
+def argumento_que_falta(intencao):
+    """Frase para pedir o que o usuário esqueceu de dizer — ou ``None``."""
+
+    if intencao.argumento:
+        return None
+
+    return {
+        "gerar_imagem": "Diga o que você quer na imagem.",
+        "abrir_aplicativo": "Diga o nome do programa que devo abrir.",
+        "tocar_musica": "Diga qual música você quer tocar.",
+        "pesquisar": "Diga o que você quer pesquisar.",
+        "clicar_em": "Diga em que devo clicar.",
+        "corrigir_texto": "Copie o texto que devo corrigir e peça de novo.",
+    }.get(intencao.nome)
+
+
+def pedir_confirmacao(intencao, pergunta=None):
+    """Frase parecida com um comando: pergunta antes de agir.
+
+    ``pergunta`` permite uma frase própria (usada quando o programa não existe e
+    o Jarvis achou um nome parecido — aí "Você quis dizer: abrir o programa X"
+    não explica o que aconteceu).
+    """
 
     global intencao_pendente
 
@@ -1208,7 +1472,7 @@ def pedir_confirmacao(intencao):
         intencao.frase,
     )
 
-    falar(f"Você quis dizer: {descricao}? Diga sim para eu fazer.")
+    falar(pergunta or f"Você quis dizer: {descricao}? Diga sim para eu fazer.")
     informar_interface(
         "aviso",
         {"nivel": "info", "texto": f"Esperando confirmação para {descricao}"},
@@ -1223,7 +1487,7 @@ def tratar_intencao_pendente(comando_normalizado):
     fluxo normal, sem ficar preso esperando uma resposta que não vem.
     """
 
-    global intencao_pendente
+    global intencao_pendente, ferramenta_pendente
 
     if intencao_pendente is None:
         return None
@@ -1242,10 +1506,13 @@ def tratar_intencao_pendente(comando_normalizado):
         "nao", "cancelar", "deixa", "deixa pra la", "nao quero", "errado",
     ]:
         intencao_pendente = None
+        ferramenta_pendente = None
         falar("Tudo bem, não vou fazer.")
         return True
 
+    # Veio outra coisa no lugar do sim/não: a confirmação morre com a dúvida.
     intencao_pendente = None
+    ferramenta_pendente = None
     return None
 
 
@@ -1255,16 +1522,17 @@ def gerar_imagem(descricao):
     O Jarvis não tem gerador de imagens. Antes, o pedido caía no modelo de
     linguagem e sumia sem resposta. Agora ele é honesto e útil: abre uma
     busca de imagens com a descrição.
+
+    ``descricao`` já chega limpa pela camada de intenções (sem o "gerar imagem"
+    do pedido). O corte por prefixo continua aqui só para o texto que vem
+    digitado do painel, que não passa por ela.
     """
 
-    descricao = normalizar(descricao)
+    descricao = _sem_verbo_inicial(descricao, "gerar_imagem")
 
-    for inicio in ("gerar imagem", "criar imagem", "fazer uma imagem", "desenhar", "gerar"):
-        if descricao.startswith(inicio):
-            descricao = descricao[len(inicio):].strip()
-            break
-
-    if not descricao:
+    # "imagem" sozinho não descreve nada: quem tratou a intenção mandou o
+    # pedido inteiro porque o usuário não disse o quê.
+    if descricao.strip() in {"", "imagem", "uma imagem", "imagens"}:
         falar("Diga o que você quer na imagem.")
         return
 
@@ -1287,6 +1555,9 @@ def executar_intencao(intencao):
     log.info("Executando intenção %s (confiança %.2f)", nome, intencao.confianca)
 
     try:
+        if nome == "ferramenta_do_agente":
+            return executar_ferramenta_pendente()
+
         if nome == "sair":
             falar("Até logo!")
             return False
@@ -1343,14 +1614,16 @@ def executar_intencao(intencao):
             return True
 
         if nome == "tocar_musica":
+            pedido = argumento or frase
+
             if "youtube music" in frase or "youtube musica" in frase:
-                tocar_no_youtube_music(frase)
+                tocar_no_youtube_music(pedido)
             else:
-                tocar_no_youtube(frase)
+                tocar_no_youtube(pedido)
             return True
 
         if nome == "pesquisar":
-            pesquisar_na_internet(frase)
+            pesquisar_na_internet(argumento or frase)
             return True
 
         if nome == "clicar_em":
@@ -1380,6 +1653,500 @@ def executar_intencao(intencao):
 
     log.warning("Intenção sem tratamento: %r", nome)
     responder_com_ollama(frase)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Ferramentas do agente (o cérebro que decide)
+# ---------------------------------------------------------------------------
+#
+# O reconhecedor de intenções continua sendo o caminho rápido: comando que ele
+# entende com confiança alta (ou que já está sendo confirmado) não passa por
+# aqui — "aumenta o volume" tem que ser instantâneo. As ferramentas entram para
+# o que a lista de frases não cobre: pedido novo, pedido com duas ações, ou
+# pedido que não é comando nenhum.
+#
+# Cada ferramenta embrulha uma função que já existia, então nada mudou de
+# comportamento: quem fala o resultado continua sendo ela (`fala_sozinha=True`),
+# e o texto devolvido serve para o modelo saber o que aconteceu e decidir o
+# próximo passo.
+
+FERRAMENTAS = RegistroDeFerramentas()
+_ferramentas_montadas = False
+
+# Chamada de ferramenta esperando o "sim" do usuário.
+ferramenta_pendente = None
+
+
+def montar_ferramentas():
+    """Registra as ferramentas. Roda uma vez, na primeira vez que precisa."""
+
+    global _ferramentas_montadas
+
+    if _ferramentas_montadas and len(FERRAMENTAS):
+        return FERRAMENTAS
+
+    _ferramentas_montadas = True
+    FERRAMENTAS.limpar()
+
+    def registrar(nome, descricao, funcao, parametros=None, obrigatorios=(), **extras):
+        return FERRAMENTAS.registrar(
+            Ferramenta(
+                nome=nome,
+                descricao=descricao,
+                executar=funcao,
+                parametros=parametros or {},
+                obrigatorios=tuple(obrigatorios),
+                **extras,
+            )
+        )
+
+    # -- programas e navegador --------------------------------------------
+
+    registrar(
+        "abrir_aplicativo",
+        "Abre um programa instalado no computador pelo nome falado "
+        "(ex.: bloco de notas, chrome, spotify, calculadora).",
+        lambda a: _resultado_de(
+            abrir_aplicativo,
+            str(a.get("nome", "")),
+            texto=f"Pedido de abrir {a.get('nome', '')!r} executado; o usuário já ouviu o resultado.",
+        ),
+        {"nome": {"type": "string", "description": "Nome do programa, como o usuário fala"}},
+        ("nome",),
+        intencao="abrir_aplicativo",
+    )
+
+    registrar(
+        "pesquisar_na_internet",
+        "Pesquisa um termo no Google e abre o resultado no navegador do painel.",
+        lambda a: _resultado_de(
+            pesquisar_na_internet,
+            str(a.get("termo", "")),
+            texto=f"Pesquisa aberta no painel por {termo_de_pesquisa(str(a.get('termo', '')))!r}.",
+        ),
+        {"termo": {"type": "string", "description": "O que pesquisar"}},
+        ("termo",),
+        intencao="pesquisar",
+    )
+
+    registrar(
+        "abrir_navegador",
+        "Abre o Google no navegador do painel.",
+        lambda a: _resultado_de(
+            navegar_no_painel, "https://www.google.com", texto="Navegador aberto."
+        ),
+        intencao="abrir_navegador",
+    )
+
+    registrar(
+        "abrir_youtube_music",
+        "Abre o YouTube Music no navegador do painel.",
+        lambda a: _resultado_de(
+            navegar_no_painel, "https://music.youtube.com", texto="YouTube Music aberto."
+        ),
+        intencao="abrir_youtube_music",
+    )
+
+    # -- música ------------------------------------------------------------
+
+    registrar(
+        "tocar_musica",
+        "Toca uma música, artista ou playlist. Use servico='youtube_music' "
+        "quando o usuário pedir o YouTube Music.",
+        lambda a: _tocar_musica_pela_ferramenta(a),
+        {
+            "nome": {"type": "string", "description": "Música, artista ou playlist"},
+            "servico": {
+                "type": "string",
+                "description": "youtube (padrão) ou youtube_music",
+                "enum": ["youtube", "youtube_music"],
+            },
+        },
+        ("nome",),
+        intencao="tocar_musica",
+    )
+
+    registrar(
+        "controlar_musica",
+        "Controla o que está tocando: pausar, continuar, próxima, anterior, "
+        "aumentar ou diminuir o volume, silenciar.",
+        lambda a: _controlar_musica_pela_ferramenta(a),
+        {
+            "acao": {
+                "type": "string",
+                "description": "O que fazer com o áudio",
+                "enum": [
+                    "pausar", "continuar", "proxima", "anterior",
+                    "aumentar_volume", "diminuir_volume", "silenciar",
+                ],
+            }
+        },
+        ("acao",),
+        intencao="musica_controle",
+    )
+
+    # -- tela e sistema ----------------------------------------------------
+
+    registrar(
+        "que_horas_sao",
+        "Diz a hora atual.",
+        lambda a: _responder_hora(),
+        intencao="hora",
+    )
+
+    registrar(
+        "descrever_tela",
+        "Olha a tela do computador e descreve o que está aberto nela.",
+        lambda a: _resultado_de(
+            descrever_tela_com_ollama,
+            texto="Descrição da tela feita em voz alta ao usuário.",
+        ),
+        intencao="descrever_tela",
+    )
+
+    registrar(
+        "clicar_em",
+        "Procura um texto na tela e clica nele — o usuário ainda confirma o clique.",
+        lambda a: _resultado_de(
+            preparar_clique,
+            str(a.get("texto", "")),
+            texto=f"Clique em {a.get('texto', '')!r} preparado; a Jarvis pediu a confirmação.",
+        ),
+        {"texto": {"type": "string", "description": "Texto visível na tela, como aparece"}},
+        ("texto",),
+        intencao="clicar_em",
+    )
+
+    registrar(
+        "gerar_imagem",
+        "O computador ainda não gera imagens de verdade: abre uma busca de "
+        "imagens com a descrição pedida.",
+        lambda a: _resultado_de(
+            gerar_imagem,
+            str(a.get("descricao", "")),
+            texto="Busca de imagens aberta (a Jarvis avisou que ainda não gera imagens).",
+        ),
+        {"descricao": {"type": "string", "description": "O que a imagem deveria mostrar"}},
+        ("descricao",),
+        intencao="gerar_imagem",
+    )
+
+    # -- painel e câmera ---------------------------------------------------
+
+    registrar(
+        "ligar_holograma",
+        "Liga ou desliga o holograma no painel.",
+        lambda a: _ligar_holograma(bool(a.get("ligar", True))),
+        {"ligar": {"type": "boolean", "description": "true liga, false desliga"}},
+        intencao="holograma",
+    )
+
+    registrar(
+        "ligar_camera",
+        "Liga ou desliga a câmera (rosto, expressões, gestos).",
+        lambda a: _ligar_camera(bool(a.get("ligar", True))),
+        {"ligar": {"type": "boolean", "description": "true liga, false desliga"}},
+        intencao="camera",
+    )
+
+    registrar(
+        "esconder_painel",
+        "Esconde a janela da Jarvis (volta pelo ícone perto do relógio).",
+        lambda a: _resultado_de(
+            informar_interface, "esconder_painel", {}, texto="Painel escondido."
+        ),
+        confirma=True,
+        pedido_de_confirmacao="esconda o painel",
+        intencao="esconder_painel",
+    )
+
+    # -- ações que mexem no que o usuário está fazendo ---------------------
+
+    registrar(
+        "corrigir_texto",
+        "Corrige o português do texto que o usuário copiou, opcionalmente colando de volta.",
+        lambda a: _corrigir_texto_pela_ferramenta(a),
+        {"colar": {"type": "boolean", "description": "true cola o texto corrigido"}},
+        confirma=True,
+        pedido_de_confirmacao="corrija o texto que você copiou",
+        intencao="corrigir_e_colar",
+    )
+
+    registrar(
+        "sair_da_jarvis",
+        "Fecha a Jarvis.",
+        lambda a: "Fechando a Jarvis.",
+        confirma=True,
+        pedido_de_confirmacao="feche a Jarvis",
+        intencao="sair",
+    )
+
+    # -- ajuda -------------------------------------------------------------
+
+    registrar(
+        "listar_capacidades",
+        "Devolve a lista do que a Jarvis sabe fazer, para responder "
+        "'o que você sabe fazer?'.",
+        lambda a: "A Jarvis sabe fazer isto:\n" + FERRAMENTAS.guia_em_texto(),
+        fala_sozinha=False,
+    )
+
+    log.info("Ferramentas do agente: %s", ", ".join(FERRAMENTAS.nomes()))
+    return FERRAMENTAS
+
+
+def registro_de_ferramentas():
+    return montar_ferramentas()
+
+
+# -- ferramentas que precisam de mais do que uma chamada -------------------
+
+
+def _tocar_musica_pela_ferramenta(argumentos):
+    pedido = str(argumentos.get("nome", ""))
+    servico = normalizar(str(argumentos.get("servico", "youtube")))
+
+    if servico == "youtube_music" or "music" in servico:
+        tocar_no_youtube_music(pedido)
+    else:
+        tocar_no_youtube(pedido)
+
+    return f"Tocando {nome_da_musica(pedido)!r} ({servico or 'youtube'})."
+
+
+def _controlar_musica_pela_ferramenta(argumentos):
+    """Traduz a ação do modelo para a frase que o controlador já entende."""
+
+    equivalentes = {
+        "pausar": "pausar",
+        "continuar": "play",
+        "proxima": "proxima musica",
+        "anterior": "musica anterior",
+        "aumentar_volume": "aumentar volume",
+        "diminuir_volume": "diminuir volume",
+        "silenciar": "silenciar",
+    }
+
+    acao = normalizar(str(argumentos.get("acao", "")))
+    frase = equivalentes.get(acao, acao)
+
+    if not controlar_musica(frase):
+        return f"Não reconheci a ação de áudio {acao!r}. Use uma das: {', '.join(equivalentes)}."
+
+    return f"Controle de áudio enviado: {acao}."
+
+
+def _responder_hora():
+    agora = datetime.now().strftime("%H:%M")
+    falar(f"Agora são {agora}.")
+    return f"São {agora}."
+
+
+def _ligar_holograma(ligar):
+    informar_interface("mostrar_holograma", {"visivel": ligar})
+    falar("Holograma ligado." if ligar else "Holograma desligado.")
+    return f"Holograma {'ligado' if ligar else 'desligado'}."
+
+
+def _ligar_camera(ligar):
+    informar_interface("definir_camera", {"ativada": ligar})
+    falar("Câmera ligada." if ligar else "Câmera desligada.")
+    return f"Câmera {'ligada' if ligar else 'desligada'}."
+
+
+def _corrigir_texto_pela_ferramenta(argumentos):
+    colar = bool(argumentos.get("colar", False))
+    corrigir_texto_copiado(colar_depois=colar)
+
+    return (
+        "Texto do usuário corrigido e colado de volta."
+        if colar
+        else "Texto do usuário corrigido (sem colar)."
+    )
+
+
+# -- decisão: caminho rápido ou agente ------------------------------------
+
+
+def eh_comando_encadeado(comando_normalizado):
+    """A frase pede mais de uma ação?
+
+    "abre o chrome **e** pesquisa o preço do ssd" era entendido como *abrir o
+    aplicativo* com o resto dentro do argumento — e o segundo pedido sumia. Com
+    duas ou mais formas verbais de comando e uma palavra de ligação, a frase vai
+    para o agente, que chama as duas ferramentas.
+    """
+
+    if " e " not in f" {comando_normalizado} " and " depois " not in comando_normalizado:
+        return False
+
+    verbos = [
+        palavra
+        for palavra in comando_normalizado.split()
+        if palavra in EQUIVALENTES_DE_VERBO
+    ]
+
+    return len(verbos) >= 2
+
+
+def contexto_para_o_agente():
+    """O que o modelo precisa saber do momento presente."""
+
+    partes = [f"Agora são {datetime.now().strftime('%d/%m/%Y %H:%M')}."]
+
+    recentes = obter_contexto_recente()
+
+    if recentes:
+        partes.append(f"Conversa recente:\n{recentes}")
+
+    aplicativos = listar_aplicativos()
+
+    if aplicativos:
+        nomes = list(aplicativos)[:40]
+        partes.append("Programas instalados (amostra): " + ", ".join(nomes))
+
+    return "\n".join(partes)
+
+
+def _resultado_de(funcao, *argumentos, texto):
+    """Roda uma função que já fala o resultado e devolve o texto para o modelo."""
+
+    funcao(*argumentos)
+    return texto
+
+
+def executar_ferramenta_do_agente(chamada):
+    """Roda uma ferramenta do agente (a exceção nunca escapa)."""
+
+    log.info(
+        "Agente pediu a ferramenta %s(%s)",
+        chamada.nome,
+        json.dumps(chamada.argumentos, ensure_ascii=False, default=str),
+    )
+
+    return executar_ferramenta(
+        registro_de_ferramentas(), chamada.nome, chamada.argumentos, log=log
+    )
+
+
+def responder_com_agente(pergunta, intencao_de_reserva=None):
+    """Deixa o modelo decidir o que fazer, executando ferramentas.
+
+    Devolve ``True`` quando o turno foi tratado aqui. ``False`` significa
+    "não deu" — aí quem chama segue pelo caminho antigo, que continua existindo
+    inteiro. É esse recuo que garante que a Jarvis funcione mesmo com o Ollama
+    desligado, o modelo trocado ou a rede fora.
+    """
+
+    global ferramenta_pendente
+
+    config = carregar_config()
+
+    agente = Agente(
+        registro=registro_de_ferramentas(),
+        modelo=modelo_local(),
+        url=OLLAMA_URL.replace("/api/generate", "/api/chat"),
+        log=log,
+        contexto=contexto_para_o_agente(),
+        max_rodadas=int(config.get("rodadas_do_agente", 4) or 4),
+    )
+
+    informar_interface("estado_voz", {"processando": True, "motivo": "decidindo o que fazer"})
+
+    try:
+        resultado = agente.responder(pergunta)
+    except Exception:
+        log.exception("O agente estourou; seguindo pelo caminho antigo")
+        return False
+    finally:
+        informar_interface("estado_voz", {"processando": False})
+
+    if resultado.erro:
+        log.warning("[%s] Agente sem resposta: %s", resultado.identificador, resultado.erro)
+
+        # Demora demais: melhor avisar e parar do que recomeçar a conversa e
+        # deixar o usuário esperando tudo de novo.
+        if resultado.motivo in ("orcamento", "tempo"):
+            falar("Isso está demorando mais do que devia. Tente de novo em um instante.")
+            return True
+
+        # Alguma ferramenta já rodou: não faz sentido repetir o pedido como
+        # conversa (e o usuário já ouviu o resultado dela).
+        if resultado.passos:
+            return True
+
+        return False
+
+    if resultado.passos:
+        log.info("[%s] Auditoria: %s", resultado.identificador, resultado.resumo_da_auditoria())
+
+    # Ferramenta que mexe no computador do usuário: pergunta antes.
+    if resultado.confirmacao is not None:
+        ferramenta = registro_de_ferramentas().obter(resultado.confirmacao.nome)
+
+        if ferramenta is None:
+            return False
+
+        ferramenta_pendente = resultado.confirmacao
+        pedir_confirmacao(
+            Intencao(
+                nome="ferramenta_do_agente",
+                confianca=0.5,
+                argumento=resultado.confirmacao.nome,
+                gatilho="agente",
+                frase=pergunta,
+            ),
+            pergunta=(
+                f"Você quer que eu "
+                f"{ferramenta.pedido_de_confirmacao or ferramenta.descricao}?"
+            ),
+        )
+        return True
+
+    if resultado.texto:
+        registrar_memoria("Jarvis", resultado.texto)
+
+    # As ferramentas antigas já falam o resultado por conta própria; só é
+    # preciso falar quando alguma delas só devolve informação (ou quando o
+    # modelo não chamou ferramenta nenhuma e a resposta é a própria conversa).
+    precisa_falar = not resultado.passos or not all(
+        _ferramenta_fala_sozinha(passo.nome) for passo in resultado.passos
+    )
+
+    if precisa_falar and resultado.texto:
+        falar(resultado.texto)
+
+    if not resultado.texto and not resultado.passos:
+        return False
+
+    return True
+
+
+def _ferramenta_fala_sozinha(nome):
+    ferramenta = registro_de_ferramentas().obter(nome)
+    return bool(ferramenta is None or ferramenta.fala_sozinha)
+
+
+def executar_ferramenta_pendente():
+    """Executa a ferramenta que estava esperando o "sim" do usuário."""
+
+    global ferramenta_pendente
+
+    chamada = ferramenta_pendente
+    ferramenta_pendente = None
+
+    if chamada is None:
+        return True
+
+    log.info("Usuário confirmou a ferramenta %s", chamada.nome)
+
+    if chamada.nome == "sair_da_jarvis":
+        falar("Até logo!")
+        return False
+
+    saida = executar_ferramenta_do_agente(chamada)
+    log.info("Resultado da ferramenta confirmada: %s", saida)
     return True
 
 
@@ -1537,7 +2304,9 @@ def preparar_ouvinte(config):
 def executar():
     """Laço principal: atende o painel, escuta e executa."""
 
-    global programa_ativo, modo_conversa_ate, gerenciador_voz
+    global programa_ativo, modo_conversa_ate, gerenciador_voz, DPI_DECLARADO
+
+    DPI_DECLARADO = configurar_escalas_de_video()
 
     config = carregar_config()
     gerenciador_voz = GerenciadorDeVoz(config=config, logger=log)

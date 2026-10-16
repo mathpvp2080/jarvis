@@ -219,12 +219,16 @@ __marimo__/
 
 # --- Jarvis: dados de execução (não versionar) ---
 jarvis.log
+jarvis.tela.log
 memoria_jarvis.jsonl
 # Modelos grandes da câmera: baixados por preparar_modelos.py
 *.task
 memoria_jarvis.jsonl.1
-jarvis.log.*
+jarvis*.log.*
 dados_navegador/
 fila_comandos/
 fila_eventos/
+# Filas antigas (read-modify-write), substituídas pelas pastas acima
+comandos_interface.json
+eventos_interface.json
 *.wav
