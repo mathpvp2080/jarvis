@@ -13,57 +13,16 @@ from __future__ import annotations
 import sys
 import tempfile
 import time
-import types
 import unittest
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(RAIZ))
+sys.path.insert(0, str(RAIZ / "testes"))
 
+from duplas import instalar_dubles  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Dublês das dependências pesadas (instaladas só onde roda de verdade)
-# ---------------------------------------------------------------------------
-
-
-class _ModuloFalso(types.ModuleType):
-    def __getattr__(self, nome):
-        if nome.startswith("__"):
-            raise AttributeError(nome)
-        return _ModuloFalso(f"{self.__name__}.{nome}")
-
-    def __call__(self, *args, **kwargs):
-        return _ModuloFalso(f"{self.__name__}()")
-
-
-class _AreaDeTransferenciaFalsa(types.ModuleType):
-    """Dublê com estado, para testar o fluxo de correção de texto."""
-
-    def __init__(self):
-        super().__init__("pyperclip")
-        self.texto = ""
-
-    def paste(self):
-        return self.texto
-
-    def copy(self, texto):
-        self.texto = texto
-
-
-def _instalar_dubles():
-    for nome in ("mss", "pyautogui", "pytesseract", "sounddevice",
-                 "speech_recognition", "PIL", "PIL.Image"):
-        if nome not in sys.modules:
-            try:
-                __import__(nome)
-            except Exception:
-                sys.modules[nome] = _ModuloFalso(nome)
-
-    if "pyperclip" not in sys.modules:
-        sys.modules["pyperclip"] = _AreaDeTransferenciaFalsa()
-
-
-_instalar_dubles()
+instalar_dubles()
 
 import main  # noqa: E402  (precisa vir depois dos dublês)
 import jarvis_comum  # noqa: E402
@@ -91,6 +50,10 @@ class TesteRotasDeComando(unittest.TestCase):
             "falar": main.falar,
             "responder_com_ollama": main.responder_com_ollama,
             "conteudo_falar": main.falar,
+            # Aqui interessa o caminho determinístico (reconhecedor de
+            # intenções). O cérebro com ferramentas tem teste próprio, em
+            # teste_agente.py — e é ligado lá, de propósito.
+            "agente_ativado": main.agente_ativado,
         }
 
         main.ARQUIVO_MEMORIA = pasta / "memoria.json"
@@ -101,6 +64,7 @@ class TesteRotasDeComando(unittest.TestCase):
         main.falar = self.falas.append
         main.responder_com_ollama = self.consultas.append
         main.informar_interface = lambda tipo, dados=None: self.eventos.append((tipo, dados))
+        main.agente_ativado = lambda: False
 
         self.addCleanup(self._restaurar)
 
@@ -112,6 +76,7 @@ class TesteRotasDeComando(unittest.TestCase):
         main.falar = self._originais["falar"]
         main.responder_com_ollama = self._originais["responder_com_ollama"]
         main.informar_interface = self._originais["informar_interface"]
+        main.agente_ativado = self._originais["agente_ativado"]
 
     # -- testes ------------------------------------------------------------
 

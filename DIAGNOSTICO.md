@@ -218,10 +218,10 @@ Itens 2, 3 e 4 são os que mais provavelmente explicam travamentos silenciosos n
 # Status da implementação (11/10/2026)
 
 Tudo o que está marcado como ✅ foi implementado e tem teste automatizado.
-Os testes rodam **sem Windows** (106 testes, `python -m unittest discover -s testes -t .`):
+Os testes rodam **sem Windows** (158 testes, `python -m unittest discover -s testes -t .`):
 
 ```
-Ran 106 tests — OK (skipped=1: fumaça da interface, precisa de PySide6 + OpenGL)
+Ran 158 tests — OK (skipped=1: fumaça da interface, precisa de PySide6 + OpenGL)
 ```
 
 ## Fase 1 — Observabilidade e não-travar
@@ -328,12 +328,36 @@ caso é ambíguo de verdade (é verbo ou é título?) e a regra ficou conservado
 só corta quando o resto não diz nada por si. Pela voz o problema não aparece,
 porque a frase vem com o verbo ("toca toque de midas").
 
+## Rodada de 16/10/2026 — o cérebro virou agente
+
+O projeto tinha **casca** de Jarvis e **cérebro** de menu de opções: a lista de
+frases decidia tudo, e o modelo de linguagem só entrava quando nada era
+reconhecido — proibido de agir, ele às vezes *afirmava* ter feito algo que não
+fez. Agora o modelo recebe as ferramentas e decide (`jarvis_agente.py`), com o
+reconhecedor antigo como caminho rápido.
+
+| # | Antes | Depois |
+|---|---|---|
+| A1 | Pedido novo não existe na lista e vira conversa ("abre o chrome e pesquisa o preço do ssd" → **abria o chrome com o resto dentro do argumento**) | O laço recebe 16 ferramentas em `tools`, executa **todas** as chamadas do turno, devolve o resultado ao modelo e responde |
+| A2 | O modelo afirmava ter executado ação (defesa era uma frase no prompt) | Ele só afirma depois de ver o resultado da ferramenta; a ação aconteceu de verdade porque foi ele que pediu |
+| A3 | Ferramenta que estoura derrubava o turno | Toda falha vira texto de resultado (`executar_ferramenta`); teto de 4 rodadas e 6 ferramentas por turno |
+| A4 | Ação perigosa por conversa não tinha freio | `corrigir_texto`, `esconder_painel` e `sair_da_jarvis` passam pela confirmação de sim/não que já existia |
+| A5 | Fala dupla seria o risco óbvio (função antiga fala + modelo resume) | `fala_sozinha` na ferramenta: quando a função antiga já fala, o texto do modelo não é falado |
+| A6 | Modelo/Ollama sem suporte a `tools` quebraria tudo | Recuo automático para um protocolo de texto (JSON no prompt) e, se nem isso, para a conversa antiga |
+
+Arquivos: `jarvis_ferramentas.py` (registro + schema), `jarvis_agente.py` (laço,
+auditoria e recuos), `main.py` (as 16 ferramentas e o roteamento híbrido),
+`testes/teste_agente.py` (52 testes, com modelo de mentira — sem rede).
+
+**Não entrou nesta rodada:** máquina de estados visual no painel, wake word
+local, memória semântica e proatividade — estão nas fases B–E do `VISAO.md`.
+
 ## O que continua pendente
 
 * **B15 completo** — thread separada para a câmera (hoje só a mitigação de cadência). É o maior custo que resta na interface: rosto + expressões + mãos rodam no timer da GUI a cada 220 ms.
 * **Caminho do "gerar imagem"** — hoje abre uma busca de imagens e avisa que não gera; um gerador local (ComfyUI/A1111) ou API continua por fazer.
 * **Memória** — `buscar_memorias_relevantes` é interseção de palavras sobre as últimas 2.000 linhas; não há SQLite/embedding, então o Jarvis não guarda fato nenhum sobre a pessoa.
-* **LLM que afirma ter executado ação** — a defesa continua sendo instrução no prompt, e modelo 3B não obedece sempre. Falta validar a resposta (ou não deixar o LLM falar de ação).
+* **LLM que afirma ter executado ação** — resolvido na rodada de 16/10 para o caminho do agente (ele só fala depois de ver o resultado da ferramenta). Continua valendo para a conversa solta, que não tem ferramenta nenhuma para chamar.
 * **CI** — não há GitHub Actions: os 106 testes só rodam quando alguém lembra. `pyproject.toml`/pin de versões também não existem.
 * **`import main` tem efeito colateral** — migra a memória legada, configura log e cria o mutex no import; os testes só não sujam o repositório porque o `.gitignore` cobre os arquivos.
 * **Reconhecimento offline mais preciso** — instalar `faster-whisper` (`pip install faster-whisper`) ou o modelo pt-BR do Vosk; o app já usa automaticamente se existir.
