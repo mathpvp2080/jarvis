@@ -28,6 +28,7 @@ Três cuidados que este módulo existe para garantir:
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -41,10 +42,19 @@ from jarvis_ferramentas import RegistroDeFerramentas, executar_ferramenta
 
 LIMITE_DE_RODADAS = 4
 LIMITE_DE_FERRAMENTAS_POR_TURNO = 6
+
+# Quanto o modelo pode demorar em **uma** chamada.
 TEMPO_DE_RESPOSTA = 60
 
+# Quanto o turno inteiro pode demorar: todas as chamadas ao modelo mais todas
+# as ferramentas. Sem este teto, 4 rodadas de 60 s deixariam o usuário esperando
+# quatro minutos em silêncio — e o pedido dele ("não estourar o tempo de
+# resposta") é justamente não deixar o Jarvis pendurado.
+ORCAMENTO_DO_TURNO = 90.0
+
 # Quanto tempo demora até desistir de uma ferramenta travada (clique, OCR,
-# abrir programa). O laço da voz não pode ficar preso.
+# abrir programa). O laço da voz não pode ficar preso: a ferramenta continua
+# rodando em segundo plano, mas o turno segue sem ela.
 TEMPO_MAXIMO_DE_FERRAMENTA = 30.0
 
 PERSONA = (
@@ -116,6 +126,11 @@ class ResultadoDoAgente:
     confirmacao: ChamadaDeFerramenta | None = None
     erro: str = ""
     identificador: str = ""
+
+    # Por que o turno não terminou: "orcamento" (passou do tempo), "tempo"
+    # (o modelo demorou demais), "modelo" (não respondeu), "rodadas" e
+    # "ferramentas" (tetos alcançados). Quem chama decide o que dizer.
+    motivo: str = ""
 
     @property
     def sucesso(self) -> bool:
@@ -227,6 +242,22 @@ def chamadas_do_texto(texto: str) -> list:
     return [ChamadaDeFerramenta(str(nome), argumentos)]
 
 
+def _motivo_do_erro(erro: Exception) -> str:
+    """Classifica a falha: foi lentidão ou foi o modelo que não está lá?
+
+    A diferença importa para quem chama: lentidão pede desculpa e para;
+    modelo fora do ar pede o recuo para a conversa antiga (que ainda funciona
+    quando o Ollama voltou, por exemplo).
+    """
+
+    texto = f"{type(erro).__name__}: {erro}".lower()
+
+    if isinstance(erro, TimeoutError) or "timed out" in texto or "timeout" in texto:
+        return "tempo"
+
+    return "modelo"
+
+
 def parece_erro_de_ferramenta(mensagem: str) -> bool:
     """O Ollama/modelo reclamou de não aceitar ``tools``?"""
 
@@ -275,7 +306,10 @@ class Agente:
         max_rodadas: int = LIMITE_DE_RODADAS,
         max_ferramentas: int = LIMITE_DE_FERRAMENTAS_POR_TURNO,
         tempo_limite: float = TEMPO_DE_RESPOSTA,
+        orcamento: float = ORCAMENTO_DO_TURNO,
+        tempo_por_ferramenta: float = TEMPO_MAXIMO_DE_FERRAMENTA,
         requisitar=requisitar_json,
+        relogio=time.monotonic,
     ) -> None:
         self.registro = registro
         self.modelo = modelo
@@ -285,7 +319,10 @@ class Agente:
         self.max_rodadas = max_rodadas
         self.max_ferramentas = max_ferramentas
         self.tempo_limite = tempo_limite
+        self.orcamento = orcamento
+        self.tempo_por_ferramenta = tempo_por_ferramenta
         self.requisitar = requisitar
+        self.relogio = relogio
 
         # Vira True quando o modelo/Ollama recusa o parâmetro `tools`; a partir
         # daí o turno segue no protocolo de texto.
@@ -317,14 +354,20 @@ class Agente:
 
         return corpo
 
-    def _conversar(self, mensagens: list) -> dict:
-        """Uma rodada de conversa com o modelo, com o recuo de protocolo."""
+    def _conversar(self, mensagens: list, tempo: float | None = None) -> dict:
+        """Uma rodada de conversa com o modelo, com o recuo de protocolo.
+
+        ``tempo`` é o que sobrou do orçamento do turno: a chamada nunca espera
+        mais do que isso.
+        """
+
+        tempo = self.tempo_limite if tempo is None else min(self.tempo_limite, tempo)
 
         try:
             dados = self.requisitar(
                 self.url,
                 self._pedido(mensagens, com_ferramentas=not self.modo_texto),
-                self.tempo_limite,
+                tempo,
             )
         except Exception as erro:
             if self.modo_texto or not parece_erro_de_ferramenta(str(erro)):
@@ -340,13 +383,48 @@ class Agente:
             dados = self.requisitar(
                 self.url,
                 self._pedido(mensagens, com_ferramentas=False),
-                self.tempo_limite,
+                tempo,
             )
 
         if not isinstance(dados, dict):
             raise RuntimeError("resposta do modelo fora do formato esperado")
 
         return dados
+
+    # -- execução das ferramentas ------------------------------------------
+
+    def _executar_com_teto(self, executar, nome: str, argumentos: dict, tempo: float) -> str:
+        """Executa a ferramenta numa thread, com teto de tempo.
+
+        Se estourar, devolve um aviso em vez de esperar: um clique assistido que
+        trava não pode deixar a Jarvis surda. A thread é daemon e continua
+        rodando sozinha — o que já ia acontecer de qualquer jeito caso o turno
+        fosse interrompido.
+        """
+
+        caixa: dict = {}
+
+        def alvo():
+            try:
+                caixa["saida"] = executar(nome, argumentos)
+            except Exception as erro:  # a ferramenta não derruba o turno
+                caixa["saida"] = f"Ferramenta {nome} falhou ({type(erro).__name__}: {erro})."
+
+        thread = threading.Thread(target=alvo, name=f"ferramenta-{nome}", daemon=True)
+        thread.start()
+        thread.join(timeout=tempo)
+
+        if thread.is_alive():
+            if self.log is not None:
+                self.log.warning(
+                    "A ferramenta %s passou de %.1f s e foi abandonada", nome, tempo
+                )
+            return (
+                f"A ferramenta {nome} demorou mais de {tempo:.0f} s e não respondeu; "
+                "siga sem ela."
+            )
+
+        return str(caixa.get("saida", ""))
 
     # -- laço --------------------------------------------------------------
 
@@ -370,9 +448,21 @@ class Agente:
         ]
 
         executadas = 0
+        limite_do_turno = self.relogio() + self.orcamento
 
         for rodada in range(1, self.max_rodadas + 1):
             resultado.rodadas = rodada
+
+            restante = limite_do_turno - self.relogio()
+
+            if restante < 1.0:
+                # Acabou o tempo do turno. Melhor dizer "demorei demais" do que
+                # deixar o usuário esperando sem saber se o Jarvis ouviu.
+                resultado.erro = f"o turno passou do orçamento de {self.orcamento:.0f} s"
+                resultado.motivo = "orcamento"
+                if self.log is not None:
+                    self.log.warning("[%s] %s", resultado.identificador, resultado.erro)
+                return resultado
 
             # O prompt do sistema é refeito a cada rodada: quando o modelo não
             # aceita `tools`, o guia das ferramentas precisa entrar no texto, e
@@ -380,9 +470,10 @@ class Agente:
             mensagens[0] = {"role": "system", "content": self._sistema()}
 
             try:
-                dados = self._conversar(mensagens)
+                dados = self._conversar(mensagens, tempo=restante)
             except Exception as erro:
                 resultado.erro = f"{type(erro).__name__}: {erro}"
+                resultado.motivo = _motivo_do_erro(erro)
                 if self.log is not None:
                     self.log.warning(
                         "[%s] O agente não respondeu: %s", resultado.identificador, resultado.erro
@@ -421,11 +512,18 @@ class Agente:
                 else:
                     if executadas >= self.max_ferramentas:
                         resultado.erro = "limite de ferramentas por turno atingido"
+                        resultado.motivo = "ferramentas"
                         return resultado
 
-                    inicio = time.monotonic()
-                    saida = executar(chamada.nome, chamada.argumentos)
-                    gasto = int((time.monotonic() - inicio) * 1000)
+                    # A ferramenta nunca pode prender o turno: um clique, um OCR
+                    # ou abrir um programa podem travar. Passado o teto, o turno
+                    # segue sem ela (ela continua em segundo plano).
+                    restante = limite_do_turno - self.relogio()
+                    teto = min(self.tempo_por_ferramenta, max(restante, 0.5))
+
+                    inicio = self.relogio()
+                    saida = self._executar_com_teto(executar, chamada.nome, chamada.argumentos, teto)
+                    gasto = int((self.relogio() - inicio) * 1000)
 
                     resultado.passos.append(
                         Passo(chamada.nome, chamada.argumentos, str(saida), gasto)
@@ -448,6 +546,7 @@ class Agente:
 
             if rodada == self.max_rodadas:
                 resultado.erro = f"o modelo pediu ferramenta em {rodada} rodadas seguidas"
+                resultado.motivo = "rodadas"
                 return resultado
 
         resultado.erro = "o agente não chegou a uma resposta"

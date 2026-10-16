@@ -2064,6 +2064,18 @@ def responder_com_agente(pergunta, intencao_de_reserva=None):
 
     if resultado.erro:
         log.warning("[%s] Agente sem resposta: %s", resultado.identificador, resultado.erro)
+
+        # Demora demais: melhor avisar e parar do que recomeçar a conversa e
+        # deixar o usuário esperando tudo de novo.
+        if resultado.motivo in ("orcamento", "tempo"):
+            falar("Isso está demorando mais do que devia. Tente de novo em um instante.")
+            return True
+
+        # Alguma ferramenta já rodou: não faz sentido repetir o pedido como
+        # conversa (e o usuário já ouviu o resultado dela).
+        if resultado.passos:
+            return True
+
         return False
 
     if resultado.passos:

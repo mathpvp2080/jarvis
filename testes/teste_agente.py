@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -27,6 +28,7 @@ instalar_dubles()
 import main
 from jarvis_agente import (
     Agente,
+    ResultadoDoAgente,
     chamadas_do_texto,
     extrair_chamadas,
 )
@@ -556,6 +558,177 @@ class TesteFerramentasDaJarvis(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 4b. Orçamento de tempo (o turno não pode ficar pendurado)
+# ---------------------------------------------------------------------------
+
+
+class TesteOrcamentoDeTempo(unittest.TestCase):
+    """Um turno nunca espera mais do que o orçamento, mesmo com o modelo lento."""
+
+    def test_orcamento_estourado_para_o_turno_antes_de_pedir_de_novo(self):
+        registro, chamadas = registro_de_teste()
+        relogio = {"agora": 0.0}
+
+        def modelo_lento(url, corpo, timeout):
+            # Cada chamada "gasta" 40 s de relógio e o roteiro nunca acaba.
+            relogio["agora"] += 40
+            return resposta_com_chamadas(("ferramenta_b", {}))
+
+        agente = Agente(
+            registro=registro,
+            modelo="m",
+            url="http://x/api/chat",
+            requisitar=modelo_lento,
+            relogio=lambda: relogio["agora"],
+            orcamento=90.0,
+            max_rodadas=10,
+        )
+
+        resultado = agente.responder("faz B para sempre")
+
+        self.assertEqual(resultado.motivo, "orcamento")
+        self.assertIn("orçamento", resultado.erro)
+        self.assertLessEqual(len(chamadas), 3)
+
+    def test_tempo_da_chamada_encolhe_com_o_orcamento_restante(self):
+        registro, _ = registro_de_teste()
+        tempos: list[float] = []
+        relogio = {"agora": 0.0}
+
+        def modelo(url, corpo, timeout):
+            tempos.append(timeout)
+            relogio["agora"] += 50
+            return resposta_de_texto("Pronto.")
+
+        agente = Agente(
+            registro=registro,
+            modelo="m",
+            url="http://x/api/chat",
+            requisitar=modelo,
+            relogio=lambda: relogio["agora"],
+            orcamento=90.0,
+            tempo_limite=60.0,
+        )
+
+        agente.responder("oi")
+
+        self.assertEqual(tempos[0], 60.0)  # primeira chamada: teto por chamada
+
+    def test_segunda_chamada_usa_so_o_que_sobrou(self):
+        registro, _ = registro_de_teste()
+        relogio = {"agora": 0.0}
+        tempos: list[float] = []
+
+        def modelo(url, corpo, timeout):
+            tempos.append(timeout)
+            relogio["agora"] += 60
+
+            if len(tempos) == 1:
+                return resposta_com_chamadas(("ferramenta_b", {}))
+
+            return resposta_de_texto("Pronto.")
+
+        agente = Agente(
+            registro=registro,
+            modelo="m",
+            url="http://x/api/chat",
+            requisitar=modelo,
+            relogio=lambda: relogio["agora"],
+            orcamento=90.0,
+            tempo_limite=60.0,
+        )
+
+        agente.responder("faz B e me diga algo")
+
+        self.assertEqual(tempos[0], 60.0)
+        self.assertLess(tempos[1], 60.0)  # só os 30 s que sobraram
+
+    def test_ferramenta_travada_e_abandonada_sem_prender_o_turno(self):
+        registro, _ = registro_de_teste()
+        modelo = _ModeloDeMentira(
+            resposta_com_chamadas(("ferramenta_b", {})),
+            resposta_de_texto("Não deu para terminar a tempo."),
+        )
+
+        def travada(nome, argumentos):
+            time.sleep(2)
+            return "demorou"
+
+        agente = Agente(
+            registro=registro,
+            modelo="m",
+            url="http://x/api/chat",
+            requisitar=modelo,
+            tempo_por_ferramenta=0.05,
+            tempo_limite=60.0,
+        )
+
+        inicio = time.monotonic()
+        resultado = agente.responder("faz B", executar=travada)
+        gasto = time.monotonic() - inicio
+
+        self.assertLess(gasto, 1.5)  # não esperou os 2 s da ferramenta
+        self.assertEqual(resultado.passos[0].nome, "ferramenta_b")
+        self.assertIn("demorou mais de", resultado.passos[0].resultado)
+        self.assertEqual(resultado.texto, "Não deu para terminar a tempo.")
+
+    def test_ferramenta_que_estoura_no_teto_nao_derruba_o_turno(self):
+        registro, _ = registro_de_teste()
+        modelo = _ModeloDeMentira(
+            resposta_com_chamadas(("ferramenta_b", {})),
+            resposta_de_texto("Segui sem ela."),
+        )
+
+        def quebrada(nome, argumentos):
+            raise ValueError("estourou")
+
+        agente = Agente(
+            registro=registro, modelo="m", url="http://x/api/chat", requisitar=modelo
+        )
+
+        resultado = agente.responder("faz B", executar=quebrada)
+
+        self.assertIn("ValueError", resultado.passos[0].resultado)
+        self.assertEqual(resultado.texto, "Segui sem ela.")
+
+    def test_erro_de_tempo_do_modelo_e_marcado_como_tempo(self):
+        registro, _ = registro_de_teste()
+        modelo = _ModeloDeMentira(erro=TimeoutError("timed out"))
+
+        resultado = Agente(
+            registro=registro, modelo="m", url="http://x/api/chat", requisitar=modelo
+        ).responder("oi")
+
+        self.assertEqual(resultado.motivo, "tempo")
+
+    def test_modelo_fora_do_ar_e_marcado_como_modelo(self):
+        registro, _ = registro_de_teste()
+        modelo = _ModeloDeMentira(erro=OSError("Connection refused"))
+
+        resultado = Agente(
+            registro=registro, modelo="m", url="http://x/api/chat", requisitar=modelo
+        ).responder("oi")
+
+        self.assertEqual(resultado.motivo, "modelo")
+
+    def test_teto_de_rodadas_tem_motivo_proprio(self):
+        registro, _ = registro_de_teste()
+        modelo = _ModeloDeMentira(
+            *[resposta_com_chamadas(("ferramenta_b", {})) for _ in range(5)]
+        )
+
+        resultado = Agente(
+            registro=registro,
+            modelo="m",
+            url="http://x/api/chat",
+            requisitar=modelo,
+            max_rodadas=2,
+        ).responder("faz B")
+
+        self.assertEqual(resultado.motivo, "rodadas")
+
+
+# ---------------------------------------------------------------------------
 # 5. Roteamento: caminho rápido ou cérebro
 # ---------------------------------------------------------------------------
 
@@ -678,6 +851,28 @@ class TesteRoteamentoDoAgente(unittest.TestCase):
         main.processar_comando("bom dia")
 
         self.assertIn(("Jarvis", "Tudo ótimo."), [(m["tipo"], m["texto"]) for m in main.memoria])
+
+    def test_demora_avisa_em_vez_de_reconsultar_a_conversa(self):
+        """Turno que estourou o tempo pede desculpa; não recomeça do zero."""
+
+        class AgenteLento:
+            def __init__(self, **kwargs):
+                pass
+
+            def responder(self, pergunta):
+                return ResultadoDoAgente(
+                    erro="o turno passou do orçamento de 90 s", motivo="orcamento"
+                )
+
+        original = main.Agente
+        main.Agente = AgenteLento
+        self.addCleanup(lambda: setattr(main, "Agente", original))
+
+        main.processar_comando("fala uma coisa qualquer para mim")
+
+        self.assertEqual(len(self.falas), 1)
+        self.assertIn("demorando mais do que devia", self.falas[0])
+        self.assertEqual(self.consultas, [])
 
     def test_agente_sem_resposta_cai_na_conversa_antiga(self):
         self._ligar_agente(_ModeloDeMentira(erro=OSError("Connection refused")))
